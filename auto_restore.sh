@@ -6,10 +6,10 @@ set -euo pipefail
 asudo(){ if [[ $EUID -ne 0 ]]; then sudo "$@"; else "$@"; fi; }
 pm_detect(){
   if command -v apt-get >/dev/null 2>&1; then echo apt; return; fi
-  if command -v dnf >/dev/null 2>&1; then echo dnf; return; fi
-  if command -v yum >/dev/null 2>&1; then echo yum; return; fi
-  if command -v zypper >/dev/null 2>&1; then echo zypper; return; fi
-  if command -v apk >/dev/null 2>&1; then echo apk; return; fi
+  if command -v dnf     >/dev/null 2>&1; then echo dnf; return; fi
+  if command -v yum     >/dev/null 2>&1; then echo yum; return; fi
+  if command -v zypper  >/dev/null 2>&1; then echo zypper; return; fi
+  if command -v apk     >/dev/null 2>&1; then echo apk; return; fi
   echo none
 }
 pm_install(){
@@ -46,21 +46,80 @@ if [[ "$PKGMGR" == "none" ]]; then
   exit 1
 fi
 
-# 依赖安装
+# 基础依赖
 case "$PKGMGR" in
   apt)
-    need_bin curl curl; need_bin jq jq; need_bin python3 python3; need_bin tar tar; need_bin gzip gzip; need_bin docker docker.io ;;
+    need_bin curl curl
+    need_bin jq jq
+    need_bin python3 python3
+    need_bin tar tar
+    need_bin gzip gzip
+    need_bin docker docker.io
+    ;;
   yum|dnf)
-    need_bin curl curl; need_bin jq jq; need_bin python3 python3; need_bin tar tar; need_bin gzip gzip
-    if ! command -v docker >/dev/null 2>&1; then pm_install "$PKGMGR" docker || pm_install "$PKGMGR" docker-ce || true; fi
+    need_bin curl curl
+    need_bin jq jq
+    need_bin python3 python3
+    need_bin tar tar
+    need_bin gzip gzip
+    if ! command -v docker >/dev/null 2>&1; then
+      pm_install "$PKGMGR" docker || pm_install "$PKGMGR" docker-ce || true
+    fi
     ;;
   zypper)
-    need_bin curl curl; need_bin jq jq; need_bin python3 python3; need_bin tar tar; need_bin gzip gzip; need_bin docker docker ;;
+    need_bin curl curl
+    need_bin jq jq
+    need_bin python3 python3
+    need_bin tar tar
+    need_bin gzip gzip
+    need_bin docker docker
+    ;;
   apk)
-    need_bin curl curl; need_bin jq jq; need_bin python3 python3; need_bin tar tar; need_bin gzip gzip; need_bin docker docker ;;
+    need_bin curl curl
+    need_bin jq jq
+    need_bin python3 python3
+    need_bin tar tar
+    need_bin gzip gzip
+    need_bin docker docker
+    ;;
 esac
 
 ensure_docker_running
+
+# ---------- NEW: 自动安装 docker compose 插件（尽力而为） ----------
+# 优先使用 docker compose (插件)，其次回退 docker-compose（旧版）
+if command -v docker >/dev/null 2>&1 && ! docker compose version >/dev/null 2>&1 2>/dev/null; then
+  echo "[INFO] 尝试安装 Docker Compose 插件..."
+  case "$PKGMGR" in
+    apt)
+      # Debian/Ubuntu 新版提供 docker-compose-plugin
+      asudo env DEBIAN_FRONTEND=noninteractive apt-get install -y docker-compose-plugin || true
+      ;;
+    yum|dnf)
+      # RHEL/CentOS/Fedora 近年版本提供 docker-compose-plugin
+      asudo "$PKGMGR" install -y docker-compose-plugin || true
+      ;;
+    zypper)
+      # openSUSE 多数仓库仍提供旧版 docker-compose（Python 实现），作为降级选项
+      asudo zypper --non-interactive install -y docker-compose || true
+      ;;
+    apk)
+      # Alpine 使用 docker-cli-compose 插件包（v2）
+      asudo apk add --no-cache docker-cli-compose || true
+      ;;
+  esac
+fi
+
+# 如果仍无 docker compose，再尝试旧版 docker-compose（部分 apt/yum 源仍有）
+if ! docker compose version >/dev/null 2>&1 2>/dev/null && ! command -v docker-compose >/dev/null 2>&1; then
+  echo "[INFO] 尝试安装旧版 docker-compose（如有）..."
+  case "$PKGMGR" in
+    apt) asudo env DEBIAN_FRONTEND=noninteractive apt-get install -y docker-compose || true ;;
+    yum|dnf) asudo "$PKGMGR" install -y docker-compose || true ;;
+    zypper) : ;;  # 上面已尝试
+    apk) : ;;     # 上面已尝试
+  esac
+fi
 
 # ---------- Main ----------
 URL="${1:-}"
@@ -87,7 +146,6 @@ RESTORE_PATH="$(tar -tzf bundle.tar.gz | grep -m1 '/restore\.sh$' || true)"
 if [[ -z "$RESTORE_PATH" ]]; then
   echo "[ERR] 压缩包内未找到 restore.sh，请检查来源是否正确"; exit 1
 fi
-# 取 restore.sh 所在目录
 RESTORE_DIR="$(dirname "$RESTORE_PATH")"
 cd "$OUTDIR/$RESTORE_DIR"
 
