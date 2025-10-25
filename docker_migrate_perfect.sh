@@ -1,161 +1,129 @@
 #!/usr/bin/env bash
-# auto_restore.sh — 输入旧机的 RID.tar.gz 链接，自动安装依赖、下载到当前目录、解压并执行 restore.sh
+# restore.sh — 从迁移包恢复：images、volumes、binds、compose、runs
 set -euo pipefail
 
-# ---------- Auto install deps ----------
-asudo(){ if [[ $EUID -ne 0 ]]; then sudo "$@"; else "$@"; fi; }
-pm_detect(){
-  if command -v apt-get >/dev/null 2>&1; then echo apt; return; fi
-  if command -v dnf     >/dev/null 2>&1; then echo dnf; return; fi
-  if command -v yum     >/dev/null 2>&1; then echo yum; return; fi
-  if command -v zypper  >/dev/null 2>&1; then echo zypper; return; fi
-  if command -v apk     >/dev/null 2>&1; then echo apk; return; fi
-  echo none
-}
-pm_install(){
-  local pm="$1"; shift
-  case "$pm" in
-    apt)
-      asudo apt-get update -y
-      asudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
-      ;;
-    dnf)    asudo dnf install -y "$@" ;;
-    yum)    asudo yum install -y "$@" ;;
-    zypper) asudo zypper --non-interactive install -y "$@" ;;
-    apk)    asudo apk add --no-cache "$@" ;;
-    *) echo "[ERR] 无法识别包管理器，手动安装：$*"; exit 1;;
-  esac
-}
-need_bin(){ local b="$1" p="$2"; command -v "$b" >/dev/null 2>&1 || { echo "[INFO] 安装依赖：$b"; pm_install "$PKGMGR" $p; }; }
-ensure_docker_running(){
-  if ! command -v docker >/dev/null 2>&1; then return; fi
-  if docker info >/dev/null 2>&1; then return; fi
-  echo "[INFO] 启动 Docker 服务..."
-  if command -v systemctl >/dev/null 2>&1; then asudo systemctl enable --now docker || true; fi
-  if ! docker info >/dev/null 2>&1 && command -v service >/dev/null 2>&1; then asudo service docker start || true; fi
-  if ! docker info >/dev/null 2>&1; then
-    echo "[WARN] 尝试直接拉起 dockerd（后台）"
-    if command -v dockerd >/dev/null 2>&1; then (asudo nohup dockerd >/var/log/dockerd.migrate.log 2>&1 &); sleep 2; fi
-  fi
-  docker info >/dev/null 2>&1 || { echo "[ERR] Docker 未成功启动，请手动检查"; exit 1; }
-}
+BUNDLE_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$BUNDLE_DIR"
 
-PKGMGR="$(pm_detect)"
-if [[ "$PKGMGR" == "none" ]]; then
-  echo "[ERR] 未检测到 apt/dnf/yum/zypper/apk，请手动安装依赖：docker jq python3 tar gzip curl"
+say()  { echo -e "\033[1;34m$*\033[0m"; }
+warn() { echo -e "\033[1;33m$*\033[0m"; }
+err()  { echo -e "\033[1;31m$*\033[0m"; }
+
+# -------- 预检查 --------
+if ! command -v jq >/dev/null 2>&1; then
+  err "[ERR] 需要 jq，请先安装后再运行（apt/yum/dnf/zypper/apk 均可安装）"
+  exit 1
+fi
+if ! command -v docker >/dev/null 2>&1; then
+  err "[ERR] 需要 docker，请先安装并启动后再运行"
   exit 1
 fi
 
-# 基础依赖
-case "$PKGMGR" in
-  apt)
-    need_bin curl curl
-    need_bin jq jq
-    need_bin python3 python3
-    need_bin tar tar
-    need_bin gzip gzip
-    need_bin docker docker.io
-    ;;
-  yum|dnf)
-    need_bin curl curl
-    need_bin jq jq
-    need_bin python3 python3
-    need_bin tar tar
-    need_bin gzip gzip
-    if ! command -v docker >/dev/null 2>&1; then
-      pm_install "$PKGMGR" docker || pm_install "$PKGMGR" docker-ce || true
+# -------- A. 加载镜像 --------
+say "[A] 加载镜像（如 images.tar 存在）"
+if [[ -f images.tar ]]; then
+  docker load -i images.tar
+else
+  warn "images.tar 不存在，将按需在线拉取镜像"
+fi
+
+# -------- B. 创建自定义网络 --------
+say "[B] 创建自定义网络（如有）"
+if jq -e '.networks|length>0' manifest.json >/dev/null; then
+  while IFS= read -r n; do
+    case "$n" in
+      bridge|host|none) : ;;
+      *)
+        docker network create "$n" >/dev/null 2>&1 || true
+        ;;
+    esac
+  done < <(jq -r '.networks[]' manifest.json)
+fi
+
+# -------- C. 回灌命名卷 --------
+say "[C] 回灌命名卷"
+if jq -e '.volumes|length>0' manifest.json >/dev/null; then
+  mkdir -p volumes
+  while IFS= read -r row; do
+    vname=$(jq -r '.name' <<<"$row")
+    file="vol_${vname}.tgz"
+    if [[ ! -f "volumes/$file" ]]; then
+      warn "  跳过 $vname（缺少 volumes/$file）"
+      continue
     fi
-    ;;
-  zypper)
-    need_bin curl curl
-    need_bin jq jq
-    need_bin python3 python3
-    need_bin tar tar
-    need_bin gzip gzip
-    need_bin docker docker
-    ;;
-  apk)
-    need_bin curl curl
-    need_bin jq jq
-    need_bin python3 python3
-    need_bin tar tar
-    need_bin gzip gzip
-    need_bin docker docker
-    ;;
-esac
-
-ensure_docker_running
-
-# ---------- NEW: 自动安装 docker compose 插件（尽力而为） ----------
-# 优先使用 docker compose (插件)，其次回退 docker-compose（旧版）
-if command -v docker >/dev/null 2>&1 && ! docker compose version >/dev/null 2>&1 2>/dev/null; then
-  echo "[INFO] 尝试安装 Docker Compose 插件..."
-  case "$PKGMGR" in
-    apt)
-      # Debian/Ubuntu 新版提供 docker-compose-plugin
-      asudo env DEBIAN_FRONTEND=noninteractive apt-get install -y docker-compose-plugin || true
-      ;;
-    yum|dnf)
-      # RHEL/CentOS/Fedora 近年版本提供 docker-compose-plugin
-      asudo "$PKGMGR" install -y docker-compose-plugin || true
-      ;;
-    zypper)
-      # openSUSE 多数仓库仍提供旧版 docker-compose（Python 实现），作为降级选项
-      asudo zypper --non-interactive install -y docker-compose || true
-      ;;
-    apk)
-      # Alpine 使用 docker-cli-compose 插件包（v2）
-      asudo apk add --no-cache docker-cli-compose || true
-      ;;
-  esac
+    echo "  - ${vname}"
+    docker volume create "$vname" >/dev/null 2>&1 || true
+    docker run --rm -v "${vname}:/to" -v "$PWD/volumes:/from" alpine:3.20 \
+      sh -c "cd /to && tar -xzf /from/${file}"
+  done < <(jq -c '.volumes[]' manifest.json)
 fi
 
-# 如果仍无 docker compose，再尝试旧版 docker-compose（部分 apt/yum 源仍有）
-if ! docker compose version >/dev/null 2>&1 2>/dev/null && ! command -v docker-compose >/dev/null 2>&1; then
-  echo "[INFO] 尝试安装旧版 docker-compose（如有）..."
-  case "$PKGMGR" in
-    apt) asudo env DEBIAN_FRONTEND=noninteractive apt-get install -y docker-compose || true ;;
-    yum|dnf) asudo "$PKGMGR" install -y docker-compose || true ;;
-    zypper) : ;;  # 上面已尝试
-    apk) : ;;     # 上面已尝试
-  esac
+# -------- D. 回灌绑定目录 --------
+say "[D] 回灌绑定目录"
+if jq -e '.binds|length>0' manifest.json >/dev/null; then
+  mkdir -p binds
+  while IFS= read -r row; do
+    host=$(jq -r '.host' <<<"$row")
+    file=$(jq -r '.file' <<<"$row")
+    echo "  - ${host}"
+    mkdir -p "$host"
+    tar -C / -xzf "binds/${file}"
+  done < <(jq -c '.binds[]' manifest.json)
 fi
 
-# ---------- Main ----------
-URL="${1:-}"
-if [[ -z "$URL" ]]; then
-  read -rp "请输入旧服务器的“一键包下载”链接（以 .tar.gz 结尾）： " URL
+# -------- E. 恢复 Compose 项目（含：启动前清理同名 *_default 网络） --------
+say "[E] 恢复 Compose 项目"
+if jq -e '.projects|length>0' manifest.json >/dev/null; then
+  mkdir -p compose_restore
+  while IFS= read -r row; do
+    name=$(jq -r '.name' <<<"$row")
+    echo "  - project: $name"
+    mkdir -p "compose_restore/${name}"
+
+    # 解出可能的打包 compose 文件
+    if compgen -G "compose/${name}/*.tgz" > /dev/null; then
+      for t in compose/${name}/*.tgz; do
+        tar -xzf "$t" -C "compose_restore/${name}" 2>/dev/null || true
+      done
+    fi
+    # 复制可能存在的原始 compose 文件
+    for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml .env docker-compose.override.yml compose.override.yaml; do
+      [[ -f "compose/${name}/${f}" ]] && cp -a "compose/${name}/${f}" "compose_restore/${name}/${f}" || true
+    done
+
+    # 统一在 up -d 前：down + 清理同名默认网络，避免“标签不匹配/外部网络”报错
+    NET="${name}_default"
+
+    if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+      (
+        cd "compose_restore/${name}"
+        docker compose down || true
+        docker network rm "$NET" >/dev/null 2>&1 || true
+        docker compose up -d
+      )
+    elif command -v docker-compose >/dev/null 2>&1; then
+      (
+        cd "compose_restore/${name}"
+        docker-compose down || true
+        docker network rm "$NET" >/dev/null 2>&1 || true
+        docker-compose up -d
+      )
+    else
+      warn "  新机未安装 docker compose/docker-compose，跳过该项目"
+    fi
+  done < <(jq -c '.projects[]' manifest.json)
 fi
-case "$URL" in http://*|https://*) : ;; *) echo "[ERR] 非 http(s) 链接"; exit 1;; esac
 
-WORKDIR="$(pwd)"
-OUTDIR="${WORKDIR}/docker_migrate_restore"
-mkdir -p "$OUTDIR"
-cd "$OUTDIR"
-
-echo "[INFO] 下载：$URL"
-curl -fL "$URL" -o bundle.tar.gz
-echo "[INFO] 保存路径：$OUTDIR/bundle.tar.gz"
-echo "[INFO] 大小：$(du -h bundle.tar.gz | awk '{print $1}')"
-
-echo "[INFO] 解压..."
-tar -xzf bundle.tar.gz
-
-# 自动识别 restore.sh 所在目录（兼容可能的多层级）
-RESTORE_PATH="$(tar -tzf bundle.tar.gz | grep -m1 '/restore\.sh$' || true)"
-if [[ -z "$RESTORE_PATH" ]]; then
-  echo "[ERR] 压缩包内未找到 restore.sh，请检查来源是否正确"; exit 1
+# -------- F. 恢复单容器（非 Compose） --------
+say "[F] 恢复单容器（非 Compose）"
+if jq -e '.runs|length>0' manifest.json >/dev/null; then
+  while IFS= read -r r; do
+    echo "  - $r"
+    bash "$r" || true
+  done < <(jq -r '.runs[]' manifest.json)
 fi
-RESTORE_DIR="$(dirname "$RESTORE_PATH")"
-cd "$OUTDIR/$RESTORE_DIR"
 
-[[ -x restore.sh ]] || chmod +x restore.sh
-echo "[INFO] 执行恢复脚本：$OUTDIR/$RESTORE_DIR/restore.sh"
-bash ./restore.sh
-
-echo "[OK] 完成。当前容器："
+# -------- G. 完成 --------
+say "[G] 完成，当前容器："
 docker ps --format '  {{.Names}}\t{{.Status}}\t{{.Ports}}'
-
-echo
-echo "[INFO] 文件均保存在：$OUTDIR"
-echo "[INFO] 你可以重复运行该目录中的 restore.sh 进行重试。"
+echo "提示：若端口被占用，请编辑 compose 或 runs 脚本后再次执行。"
