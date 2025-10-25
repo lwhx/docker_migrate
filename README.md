@@ -18,7 +18,7 @@
 
 ### 🖥️ 在旧服务器执行：
 ```bash
-bash <(curl -sSL https://raw.githubusercontent.com/lx969788249/docker_migrate/master/docker_migrate_perfect.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/lx969788249/docker_migrate/master/docker_migrate_perfect.sh)
 ```
 执行后会生成迁移包并显示下载链接，例如：
 
@@ -29,7 +29,7 @@ http://192.168.1.88:8080/AbCdEf1234.tar.gz
 
 💻 在新服务器执行：
 ```bash
-bash <(curl -sSL https://raw.githubusercontent.com/lx969788249/docker_migrate/master/auto_restore.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/lx969788249/docker_migrate/master/auto_restore.sh)
 ```
 然后粘贴旧服务器输出的链接（以 .tar.gz 结尾）即可自动下载并恢复所有容器。
 
