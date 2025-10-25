@@ -1,12 +1,110 @@
 #!/usr/bin/env bash
 # docker_migrate_perfect.sh — final with: compose-first, images.tar, split volumes/binds,
 # port auto-pick, primary IP detect, http cleanup, + single-file bundle RID.tar.gz
+# + Auto-deps install (docker jq python3 tar gzip curl)
 set -euo pipefail
 
-need(){ command -v "$1" >/dev/null 2>&1 || { echo -e "\033[1;31m[ERR]\033[0m need: $1"; exit 1; }; }
-need docker; need jq; need python3; need tar; need gzip
+# ---------- Auto install deps ----------
+asudo(){ if [[ $EUID -ne 0 ]]; then sudo "$@"; else "$@"; fi; }
+pm_detect(){
+  if command -v apt-get >/dev/null 2>&1; then echo apt; return; fi
+  if command -v dnf >/dev/null 2>&1; then echo dnf; return; fi
+  if command -v yum >/dev/null 2>&1; then echo yum; return; fi
+  if command -v zypper >/dev/null 2>&1; then echo zypper; return; fi
+  if command -v apk >/dev/null 2>&1; then echo apk; return; fi
+  echo none
+}
+pm_install(){
+  local pm="$1"; shift
+  case "$pm" in
+    apt)
+      asudo apt-get update -y
+      asudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+      ;;
+    dnf)    asudo dnf install -y "$@" ;;
+    yum)    asudo yum install -y "$@" ;;
+    zypper) asudo zypper --non-interactive install -y "$@" ;;
+    apk)    asudo apk add --no-cache "$@" ;;
+    *) echo "[ERR] 无法识别包管理器，手动安装：$*"; exit 1;;
+  esac
+}
+need_bin(){
+  local b="$1" p="$2"
+  command -v "$b" >/dev/null 2>&1 || { echo "[INFO] 安装依赖：$b"; pm_install "$PKGMGR" $p; }
+}
+ensure_docker_running(){
+  if ! command -v docker >/dev/null 2>&1; then return; fi
+  if docker info >/dev/null 2>&1; then return; fi
+  echo "[INFO] 启动 Docker 服务..."
+  if command -v systemctl >/dev/null 2>&1; then
+    asudo systemctl enable --now docker || true
+  fi
+  if ! docker info >/dev/null 2>&1 && command -v service >/dev/null 2>&1; then
+    asudo service docker start || true
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    echo "[WARN] 尝试直接拉起 dockerd（临时前台/后台）"
+    if command -v dockerd >/dev/null 2>&1; then
+      (asudo nohup dockerd >/var/log/dockerd.migrate.log 2>&1 &); sleep 2
+    fi
+  fi
+  docker info >/dev/null 2>&1 || { echo "[ERR] Docker 未成功启动，请手动检查"; exit 1; }
+}
 
-# -------- args --------
+PKGMGR="$(pm_detect)"
+if [[ "$PKGMGR" == "none" ]]; then
+  echo "[ERR] 未检测到 apt/dnf/yum/zypper/apk，请手动安装依赖：docker jq python3 tar gzip curl"
+  exit 1
+fi
+
+# 依赖映射（各发行版可能略有出入，尽量通用）
+case "$PKGMGR" in
+  apt)
+    need_bin curl curl
+    need_bin jq jq
+    need_bin python3 python3
+    need_bin tar tar
+    need_bin gzip gzip
+    need_bin docker docker.io
+    ;;
+  yum|dnf)
+    need_bin curl curl
+    need_bin jq jq
+    need_bin python3 python3
+    need_bin tar tar
+    need_bin gzip gzip
+    # RHEL/Fedora/CentOS：包名常为 docker 或 docker-ce（这里优先 docker）
+    if ! command -v docker >/dev/null 2>&1; then
+      pm_install "$PKGMGR" docker || pm_install "$PKGMGR" docker-ce || true
+    fi
+    ;;
+  zypper)
+    need_bin curl curl
+    need_bin jq jq
+    need_bin python3 python3
+    need_bin tar tar
+    need_bin gzip gzip
+    need_bin docker docker
+    ;;
+  apk)
+    need_bin curl curl
+    need_bin jq jq
+    need_bin python3 python3
+    need_bin tar tar
+    need_bin gzip gzip
+    need_bin docker docker
+    ;;
+esac
+
+ensure_docker_running
+
+# ---------- UI helpers ----------
+BLUE(){ echo -e "\033[1;34m$*\033[0m"; }
+YEL(){ echo -e "\033[1;33m$*\033[0m"; }
+RED(){ echo -e "\033[1;31m$*\033[0m"; }
+OK(){ echo -e "\033[1;32m$*\033[0m"; }
+
+# ---------- Args ----------
 NO_STOP="0"
 INCLUDE_LIST=""
 for arg in "$@"; do
@@ -25,17 +123,11 @@ HLP
   esac
 done
 
-# -------- ui helpers --------
-BLUE(){ echo -e "\033[1;34m$*\033[0m"; }
-YEL(){ echo -e "\033[1;33m$*\033[0m"; }
-RED(){ echo -e "\033[1;31m$*\033[0m"; }
-OK(){ echo -e "\033[1;32m$*\033[0m"; }
-
-# -------- small helpers --------
+# ---------- helpers ----------
 pick_free_port(){ local p="${1:-8080}"; for _ in $(seq 0 50); do ss -lnt 2>/dev/null|awk '{print $4}'|grep -q ":$p$"||{ echo "$p"; return; }; p=$((p+1)); done; echo "$1"; }
 pick_primary_ip(){ ip -4 -o addr show 2>/dev/null | awk '!/ lo| docker| veth| br-| kube/ {print $4}' | cut -d/ -f1 | head -n1; }
 
-# -------- dirs & ids --------
+# ---------- dirs & ids ----------
 PORT="$(pick_free_port "${PORT:-8080}")"
 WORKDIR="$(pwd)"
 STAMP="$(date +%Y%m%d-%H%M%S)"
@@ -45,7 +137,7 @@ mkdir -p "${BUNDLE}"/{runs,volumes,binds,compose,meta}
 
 BLUE "[INFO] Bundle: ${BUNDLE}"
 
-# -------- select containers --------
+# ---------- select containers ----------
 mapfile -t ALL_IDS < <(docker ps --format '{{.ID}}')
 ((${#ALL_IDS[@]})) || { RED "[ERR] 没有运行中的容器"; exit 1; }
 
@@ -72,7 +164,7 @@ else
   fi
 fi
 
-# -------- discovery --------
+# ---------- discovery ----------
 BLUE "[INFO] 采集元数据 ..."
 declare -A IMGSET=() NETWORKS=() CONTAINER_NAME=() CONTAINER_IS_COMPOSE=()
 declare -A PROJECT_KEY_OF=() COMPOSE_GROUP=() COMPOSE_CFGS=() SINGLETONS=()
@@ -97,7 +189,7 @@ for id in "${IDS[@]}"; do
   echo "$j" > "${BUNDLE}/meta/${name}.inspect.json"
 done
 
-# -------- stop window --------
+# ---------- stop window ----------
 if [[ "$NO_STOP" == "1" ]]; then
   YEL "[WARN] --no-stop：不停机备份，可能不一致（数据库尤需注意）"
 else
@@ -109,7 +201,7 @@ else
   fi
 fi
 
-# -------- pack volumes & binds --------
+# ---------- pack volumes & binds ----------
 BLUE "[INFO] 备份卷与绑定目录 ..."
 declare -a MAN_VOL=() MAN_BIND=()
 for id in "${IDS[@]}"; do
@@ -139,12 +231,12 @@ for id in "${IDS[@]}"; do
   done < <(jq -c '.[0].Mounts[]?' <<<"$j")
 done
 
-# -------- save images --------
+# ---------- save images ----------
 BLUE "[INFO] 保存镜像 images.tar ..."
 mapfile -t IMAGES < <(printf "%s\n" "${!IMGSET[@]}" | sort -u)
 ((${#IMAGES[@]})) && docker image save -o "${BUNDLE}/images.tar" "${IMAGES[@]}" || YEL "[WARN] 未收集到镜像名？"
 
-# -------- pack compose --------
+# ---------- pack compose ----------
 BLUE "[INFO] 处理 Compose 项目 ..."
 for key in "${!COMPOSE_GROUP[@]}"; do
   proj="${key%%|*}"; wdir="${key#*|}"; target="${BUNDLE}/compose/${proj}"; mkdir -p "$target"
@@ -162,7 +254,7 @@ for key in "${!COMPOSE_GROUP[@]}"; do
   fi
 done
 
-# -------- gen docker run for non-compose --------
+# ---------- gen docker run for non-compose ----------
 BLUE "[INFO] 生成非 Compose 容器的 docker run 脚本 ..."
 gen_run_from_inspect(){ local f="$1"
   local name image restart netmode priv shm
@@ -203,7 +295,7 @@ for id in "${IDS[@]}"; do
   gen_run_from_inspect "${BUNDLE}/meta/${name}.inspect.json" > "$out"; chmod +x "$out"; RUNS+=("runs/${name}.sh")
 done
 
-# -------- manifest & restore.sh --------
+# ---------- manifest & restore.sh ----------
 BLUE "[INFO] 生成 manifest.json 与 restore.sh ..."
 mapfile -t NETLIST < <(printf "%s\n" "${!NETWORKS[@]}" | sort -u)
 declare -a MAN_PROJECTS=()
@@ -297,19 +389,19 @@ echo "提示：若端口被占用，请编辑 compose 或 runs 脚本后再次�
 REST_SH
 chmod +x "${BUNDLE}/restore.sh"
 
-# -------- README --------
+# ---------- README ----------
 cat > "${BUNDLE}/README.txt" <<EOF
 新服务器操作：
 - 推荐：使用 auto_restore.sh 输入“一键包下载”链接（.tar.gz），自动下载解压并执行 restore.sh
 - 手动：下载整个目录后，bash restore.sh
 EOF
 
-# -------- single-file bundle (RID.tar.gz) --------
+# ---------- single-file bundle (RID.tar.gz) ----------
 BUNDLE_BASENAME="$(basename "${BUNDLE}")"
 ( cd "$(dirname "${BUNDLE}")" && tar -czf "${BUNDLE_BASENAME}.tar.gz" "${BUNDLE_BASENAME}" )
 SINGLE_TAR_PATH="$(dirname "${BUNDLE}")/${BUNDLE_BASENAME}.tar.gz"
 
-# -------- list & HTTP --------
+# ---------- list & HTTP ----------
 OK  "[OK] 生成完成：${BUNDLE}"
 ( cd "${BUNDLE}" && ls -lah )
 
