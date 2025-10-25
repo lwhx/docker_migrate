@@ -3,6 +3,7 @@
 # port auto-pick, advertise public/LAN URL, http cleanup, + single-file bundle RID.tar.gz
 # + Auto-deps install (docker jq python3 tar gzip curl)
 # + Progress indicators for long-running steps
+# + Safe cleanup on normal/abnormal exit (AUTO_CLEAN / AUTO_CLEAN_ALL)
 set -euo pipefail
 
 # ---------- Auto install deps ----------
@@ -175,8 +176,10 @@ for arg in "$@"; do
 用法:
   bash docker_migrate_perfect.sh [--no-stop] [--include=name1,name2]
 环境变量:
-  PORT=8080           # HTTP 端口（默认 8080；被占用会自动递增）
-  ADVERTISE_HOST=IP   # 显示给用户的“公网/域名”（覆盖自动探测）
+  PORT=8080            # HTTP 端口（默认 8080；被占用会自动递增）
+  ADVERTISE_HOST=IP    # 显示给用户的“公网/域名”（覆盖自动探测）
+  AUTO_CLEAN=1         # 结束后自动清理 bundle/<RID>/（保留 <RID>.tar.gz）
+  AUTO_CLEAN_ALL=1     # 结束后连 <RID>.tar.gz 一并删除（危险）
 HLP
       exit 0;;
   esac
@@ -251,7 +254,7 @@ done
 if [[ "$NO_STOP" == "1" ]]; then
   YEL "[WARN] --no-stop：不停机备份，可能不一致（数据库尤需注意）"
 else
-  read -rp "是否现在停机以确保一致性备份？(也可以不停)[Y/n] " STOPNOW; STOPNOW=${STOPNOW:-Y}
+  read -rp "是否现在停机以确保一致性备份？[Y/n] " STOPNOW; STOPNOW=${STOPNOW:-Y}
   if [[ "$STOPNOW" =~ ^[Yy]$ ]]; then
     for id in "${IDS[@]}"; do n="${CONTAINER_NAME[$id]}"; BLUE "[INFO] 停止 $n ..."; docker stop "$n" >/dev/null; done
   else
@@ -367,7 +370,7 @@ for id in "${IDS[@]}"; do
   gen_run_from_inspect "${BUNDLE}/meta/${name}.inspect.json" > "$out"; chmod +x "$out"; RUNS+=("runs/${name}.sh")
 done
 
-# -------- manifest & restore.sh（带旋转指示器） --------
+# -------- manifest & restore.sh（带旋转指示器 + 安全 heredoc） --------
 spinner_run "[INFO] 生成 manifest.json 与 restore.sh ..." bash -c '
   mapfile -t NETLIST < <(printf "%s\n" "${!NETWORKS[@]}" | sort -u)
   declare -a MAN_PROJECTS=()
@@ -475,13 +478,53 @@ BUNDLE_BASENAME="$(basename "${BUNDLE}")"
 ( cd "$(dirname "${BUNDLE}")" && tar -czf "${BUNDLE_BASENAME}.tar.gz" "${BUNDLE_BASENAME}" )
 SINGLE_TAR_PATH="$(dirname "${BUNDLE}")/${BUNDLE_BASENAME}.tar.gz"
 
-# ---------- list & HTTP ----------
+# ---------- HTTP serve + graceful cleanup ----------
 OK  "[OK] 生成完成：${BUNDLE}"
 ( cd "${BUNDLE}" && ls -lah )
 
 BLUE "[INFO] 启动 HTTP 服务（python3 -m http.server ${PORT}）"
-cleanup_http(){ kill "${SHPID}" 2>/dev/null || true; }
-trap cleanup_http EXIT
+SHPID=""
+cleanup_http(){ [[ -n "${SHPID:-}" ]] && kill "${SHPID}" 2>/dev/null || true; }
+cleanup_bundle() {
+  # AUTO_CLEAN_ALL 优先；否则 AUTO_CLEAN；否则询问（交互）
+  local mode="${AUTO_CLEAN_ALL:-0}${AUTO_CLEAN:-0}"
+  if [[ "${AUTO_CLEAN_ALL:-0}" == "1" ]]; then
+    rm -rf "$(dirname "${BUNDLE}")/$(basename "${BUNDLE}").tar.gz" "${BUNDLE}" || true
+    OK "[OK] 已自动删除：${BUNDLE} 及对应 .tar.gz"
+  elif [[ "${AUTO_CLEAN:-0}" == "1" ]]; then
+    rm -rf "${BUNDLE}" || true
+    OK "[OK] 已自动删除：${BUNDLE}（保留 .tar.gz）"
+  else
+    # 尝试交互
+    if [[ -t 0 ]]; then
+      read -rp $'\n是否清理工作目录（保留 .tar.gz）？[y/N] ' ans
+      if [[ "$ans" =~ ^[Yy]$ ]]; then
+        rm -rf "${BUNDLE}" || true
+        OK "[OK] 已删除：${BUNDLE}"
+      else
+        YEL "[SKIP] 保留工作目录：${BUNDLE}"
+      fi
+      read -rp "是否连同 .tar.gz 一并删除？[y/N] " ans2
+      if [[ "$ans2" =~ ^[Yy]$ ]]; then
+        rm -f "$(dirname "${BUNDLE}")/$(basename "${BUNDLE}").tar.gz" || true
+        OK "[OK] 已删除：$(dirname "${BUNDLE}")/$(basename "${BUNDLE}").tar.gz"
+      else
+        YEL "[SKIP] 保留压缩包：$(dirname "${BUNDLE}")/$(basename "${BUNDLE}").tar.gz"
+      fi
+    else
+      YEL "[INFO] 非交互模式：未设置 AUTO_CLEAN/AUTO_CLEAN_ALL，跳过清理"
+    fi
+  fi
+}
+graceful_exit(){
+  echo
+  YEL "[INFO] 即将退出，正在清理 ..."
+  cleanup_http
+  cleanup_bundle
+  exit 0
+}
+trap graceful_exit INT TERM
+
 ( cd "${WORKDIR}/bundle" && python3 -m http.server "${PORT}" >/dev/null 2>&1 & )
 SHPID=$!; sleep 1
 
@@ -503,9 +546,12 @@ echo
 YEL "[TIP] 目录浏览（LAN）： http://${LAN_IP}:${PORT}/${RID}/"
 YEL "[WARN] HTTP 未鉴权，仅限可信网络使用。下载完成后请关闭此窗口。"
 
-# 非交互运行：直接退出（留给外部进程管理 http）
-if [[ -n "${INCLUDE_LIST}" || "$NO_STOP" == "1" ]]; then
-  sleep 2; exit 0
+# 交互等待；回车 -> 清理
+if [[ -t 0 ]]; then
+  read -rp $'\n按回车键停止 HTTP 并退出 ... '
+  graceful_exit
+else
+  # 非交互运行（例如被其它脚本调用）
+  # 不等待，直接退出；清理逻辑依赖 AUTO_CLEAN(_ALL)
+  graceful_exit
 fi
-
-read -rp $'\n按回车键停止 HTTP 并退出 ... '
