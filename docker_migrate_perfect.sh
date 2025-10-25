@@ -383,12 +383,20 @@ if jq -e ".volumes|length>0" manifest.json >/dev/null; then
   done < <(jq -c ".volumes[]" manifest.json)
 fi
 
-say "[D] 回灌绑定目录]"
+say "[D] 回灌绑定目录"
 if jq -e ".binds|length>0" manifest.json >/dev/null; then
   mkdir -p binds
   while IFS= read -r row; do
-    host=$(jq -r ".host" <<<"$row"); file=$(jq -r ".file" <<<"$row")
-    echo "  - ${host}"; mkdir -p "$host"; tar -C / -xzf "binds/${file}"
+    host=$(jq -r ".host" <<<"$row")
+    file=$(jq -r ".file" <<<"$row")
+    echo "  - ${host}"
+
+    # 只创建父目录，兼容文件型绑定（例如 /etc/localtime）
+    parent="$(dirname "$host")"
+    mkdir -p "$parent" || true
+
+    # 归档按绝对路径制作，直接从根解包覆盖/写入
+    tar -C / -xzf "binds/${file}"
   done < <(jq -c ".binds[]" manifest.json)
 fi
 
