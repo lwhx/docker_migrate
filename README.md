@@ -1,8 +1,3 @@
-好的 ✅
-以下是这个脚本的极简 README 模板（你可以直接放到 GitHub 同目录下的 README.md 或发给其他人使用）：
-
-⸻
-
 🐳 Docker 一键迁移脚本
 
 docker_migrate_perfect.sh
