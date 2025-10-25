@@ -93,7 +93,6 @@ RED(){ echo -e "\033[1;31m$*\033[0m"; }
 OK(){ echo -e "\033[1;32m$*\033[0m"; }
 
 # --- 进度工具 ---
-# 文件增长进度（后台命令写入 $1 文件时，显示大小增长）
 progress_file_growth() {
   local file="$1"; local label="${2:-进度}"; local pid="$3"
   local last=""
@@ -115,7 +114,6 @@ progress_file_growth() {
     printf "\r%s 完成\n" "$label"
   fi
 }
-# 旋转指示器（包裹一条耗时命令）
 spinner_run() {
   local msg="$1"; shift
   local spin='-\|/' i=0
@@ -312,7 +310,12 @@ for key in "${!COMPOSE_GROUP[@]}"; do
   BLUE "  [COMPOSE] $proj @ $wdir"
   cfgs="${COMPOSE_CFGS[$key]:-}"
   if [[ -n "$cfgs" ]]; then
-    IFS=',' read -r -a files <<<"$cfgs"; ( cd "$wdir" && tar -czf "${target}/compose_${proj}.tgz" "${files@"@"}" 2>/dev/null || true )
+    IFS=',' read -r -a files <<<"$cfgs"
+    if ((${#files[@]})); then
+      ( cd "$wdir" && tar -czf "${target}/compose_${proj}.tgz" "${files[@]}" 2>/dev/null || true )
+    else
+      YEL "  [WARN] $proj 的 config_files 为空，跳过打包"
+    fi
   else
     for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml .env docker-compose.override.yml compose.override.yaml; do
       [[ -f "${wdir}/${f}" ]] && cp -a "${wdir}/${f}" "${target}/" || true
