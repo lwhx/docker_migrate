@@ -2,16 +2,17 @@
 # docker_migrate_perfect.sh — compose-first, images.tar, split volumes/binds,
 # port auto-pick, primary IP detect, http cleanup, + single-file bundle RID.tar.gz
 # + Auto-deps install (docker jq python3 tar gzip curl)
+# + Progress indicators for long-running steps
 set -euo pipefail
 
 # ---------- Auto install deps ----------
 asudo(){ if [[ $EUID -ne 0 ]]; then sudo "$@"; else "$@"; fi; }
 pm_detect(){
   if command -v apt-get >/dev/null 2>&1; then echo apt; return; fi
-  if command -v dnf >/dev/null 2>&1; then echo dnf; return; fi
-  if command -v yum >/dev/null 2>&1; then echo yum; return; fi
-  if command -v zypper >/dev/null 2>&1; then echo zypper; return; fi
-  if command -v apk >/dev/null 2>&1; then echo apk; return; fi
+  if command -v dnf     >/dev/null 2>&1; then echo dnf; return; fi
+  if command -v yum     >/dev/null 2>&1; then echo yum; return; fi
+  if command -v zypper  >/dev/null 2>&1; then echo zypper; return; fi
+  if command -v apk     >/dev/null 2>&1; then echo apk; return; fi
   echo none
 }
 pm_install(){
@@ -101,6 +102,48 @@ BLUE(){ echo -e "\033[1;34m$*\033[0m"; }
 YEL(){ echo -e "\033[1;33m$*\033[0m"; }
 RED(){ echo -e "\033[1;31m$*\033[0m"; }
 OK(){ echo -e "\033[1;32m$*\033[0m"; }
+
+# --- 进度工具 ---
+# 文件增长进度：在后台命令将内容写入 $1 时，实时显示 du -h 大小；$2 为提示文本
+progress_file_growth() {
+  local file="$1"; local label="${2:-进度}"; local pid="$3"
+  local last=""
+  printf "%s " "$label"
+  while kill -0 "$pid" 2>/dev/null; do
+    if [[ -f "$file" ]]; then
+      size="$(du -h "$file" 2>/dev/null | awk '{print $1}')"
+      [[ "$size" != "$last" ]] && printf "\r%s 已写入：%s" "$label" "${size:-0B}"
+      last="$size"
+    else
+      printf "\r%s 正在开始..." "$label"
+    fi
+    sleep 1
+  done
+  if [[ -f "$file" ]]; then
+    size="$(du -h "$file" 2>/dev/null | awk '{print $1}')"
+    printf "\r%s 完成：%s\n" "$label" "${size:-0B}"
+  else
+    printf "\r%s 完成\n" "$label"
+  fi
+}
+
+# 旋转指示器：在某段命令执行期间显示转动光标；$1 为提示文本
+spinner_run() {
+  local msg="$1"; shift
+  local spin='-\|/' i=0
+  printf "%s " "$msg"
+  (
+    "$@"
+  ) &
+  local cmd_pid=$!
+  while kill -0 "$cmd_pid" 2>/dev/null; do
+    i=$(( (i+1) %4 ))
+    printf "\r%s %s" "$msg" "${spin:$i:1}"
+    sleep 0.15
+  done
+  wait "$cmd_pid"
+  printf "\r%s 完成\n" "$msg"
+}
 
 # ---------- Args ----------
 NO_STOP="0"
@@ -229,12 +272,21 @@ for id in "${IDS[@]}"; do
   done < <(jq -c '.[0].Mounts[]?' <<<"$j")
 done
 
-# ---------- save images ----------
-BLUE "[INFO] 保存镜像 images.tar ..."
+# -------- save images（带进度） --------
+BLUE "[INFO] 保存镜像 images.tar ...（数据量大时可能较久，请耐心等待）"
 mapfile -t IMAGES < <(printf "%s\n" "${!IMGSET[@]}" | sort -u)
-((${#IMAGES[@]})) && docker image save -o "${BUNDLE}/images.tar" "${IMAGES[@]}" || YEL "[WARN] 未收集到镜像名？"
+if ((${#IMAGES[@]})); then
+  OUT_IMG="${BUNDLE}/images.tar"
+  ( docker image save -o "${OUT_IMG}" "${IMAGES[@]}" ) &
+  save_pid=$!
+  progress_file_growth "${OUT_IMG}" "[进度] images.tar" "${save_pid}"
+  wait "${save_pid}"
+  OK "[OK] images.tar 已生成，大小：$(du -h "${OUT_IMG}" | awk '{print $1}')"
+else
+  YEL "[WARN] 未收集到镜像名？"
+fi
 
-# ---------- pack compose ----------
+# -------- pack compose ----------
 BLUE "[INFO] 处理 Compose 项目 ..."
 for key in "${!COMPOSE_GROUP[@]}"; do
   proj="${key%%|*}"; wdir="${key#*|}"; target="${BUNDLE}/compose/${proj}"; mkdir -p "$target"
@@ -252,7 +304,7 @@ for key in "${!COMPOSE_GROUP[@]}"; do
   fi
 done
 
-# ---------- gen docker run for non-compose ----------
+# -------- gen docker run for non-compose ----------
 BLUE "[INFO] 生成非 Compose 容器的 docker run 脚本 ..."
 gen_run_from_inspect(){ local f="$1"
   local name image restart netmode priv shm
@@ -293,34 +345,34 @@ for id in "${IDS[@]}"; do
   gen_run_from_inspect "${BUNDLE}/meta/${name}.inspect.json" > "$out"; chmod +x "$out"; RUNS+=("runs/${name}.sh")
 done
 
-# ---------- manifest & restore.sh ----------
-BLUE "[INFO] 生成 manifest.json 与 restore.sh ..."
-mapfile -t NETLIST < <(printf "%s\n" "${!NETWORKS[@]}" | sort -u)
-declare -a MAN_PROJECTS=()
-for key in "${!COMPOSE_GROUP[@]}"; do
-  proj="${key%%|*}"; wdir="${key#*|}"
-  files_json="[]"
-  if ls -1 "${BUNDLE}/compose/${proj}/" >/dev/null 2>&1; then
-    mapfile -t FLS < <(ls -1 "${BUNDLE}/compose/${proj}/" 2>/dev/null || true)
-    ((${#FLS[@]})) && files_json=$(printf '"%s",' "${FLS[@]}" | sed 's/,$//' | awk '{print "["$0"]"}')
-  fi
-  MAN_PROJECTS+=("{\"name\":\"${proj}\",\"working_dir\":\"${wdir}\",\"files\":${files_json}}")
-done
+# -------- manifest & restore.sh（带旋转指示器） --------
+spinner_run "[INFO] 生成 manifest.json 与 restore.sh ..." bash -c '
+  mapfile -t NETLIST < <(printf "%s\n" "${!NETWORKS[@]}" | sort -u)
+  declare -a MAN_PROJECTS=()
+  for key in "${!COMPOSE_GROUP[@]}"; do
+    proj="${key%%|*}"; wdir="${key#*|}"
+    files_json="[]"
+    if ls -1 "'"${BUNDLE}"'/compose/${proj}/" >/dev/null 2>&1; then
+      mapfile -t FLS < <(ls -1 "'"${BUNDLE}"'/compose/${proj}/" 2>/dev/null || true)
+      ((${#FLS[@]})) && files_json=$(printf "\"%s\"," "${FLS[@]}" | sed "s/,\$//" | awk "{print \"[\"$0\"]\"}")
+    fi
+    MAN_PROJECTS+=("{\"name\":\"${proj}\",\"working_dir\":\"${wdir}\",\"files\":${files_json}}")
+  done
 
-{
-  echo '{'
-  echo "  \"created_at\": \"${STAMP}\","
-  echo "  \"bundle_id\": \"${RID}\","
-  echo "  \"images\": [$(printf '"%s",' "${IMAGES[@]}" | sed 's/,$//')],"
-  echo "  \"networks\": [$(printf '"%s",' "${NETLIST[@]}" | sed 's/,$//')],"
-  echo "  \"projects\": [$(printf '%s,' "${MAN_PROJECTS[@]}" | sed 's/,$//')],"
-  echo "  \"volumes\": [$(printf '%s,' "${MAN_VOL[@]}" | sed 's/,$//')],"
-  echo "  \"binds\": [$(printf '%s,' "${MAN_BIND[@]}" | sed 's/,$//')],"
-  echo "  \"runs\": [$(printf '"%s",' "${RUNS[@]}" | sed 's/,$//')]"
-  echo '}'
-} > "${BUNDLE}/manifest.json"
+  {
+    echo "{"
+    echo "  \"created_at\": \"'"${STAMP}"'","
+    echo "  \"bundle_id\": \"'"${RID}"'","
+    echo "  \"images\": [$(printf "\"%s\"," "${IMAGES[@]}" | sed "s/,\$//")],"
+    echo "  \"networks\": [$(printf "\"%s\"," "${NETLIST[@]}" | sed "s/,\$//")],"
+    echo "  \"projects\": [$(printf "%s," "${MAN_PROJECTS[@]}" | sed "s/,\$//")],"
+    echo "  \"volumes\": [$(printf "%s," "${MAN_VOL[@]}" | sed "s/,\$//")],"
+    echo "  \"binds\": [$(printf "%s," "${MAN_BIND[@]}" | sed "s/,\$//")],"
+    echo "  \"runs\": [$(printf "\"%s\"," "${RUNS[@]}" | sed "s/,\$//")]"
+    echo "}"
+  } > "'"${BUNDLE}"'/manifest.json"
 
-cat > "${BUNDLE}/restore.sh" <<'REST_SH'
+  cat > "'"${BUNDLE}"'/restore.sh' <<'"'"'REST_SH'"'"'
 #!/usr/bin/env bash
 set -euo pipefail
 BUNDLE_DIR="$(cd "$(dirname "$0")" && pwd)"; cd "$BUNDLE_DIR"
@@ -330,62 +382,64 @@ say "[A] 加载镜像（如 images.tar 存在）"
 [[ -f images.tar ]] && docker load -i images.tar || warn "images.tar 不存在，将按需在线拉取镜像"
 
 say "[B] 创建自定义网络（如有）"
-if jq -e '.networks|length>0' manifest.json >/dev/null; then
-  for n in $(jq -r '.networks[]' manifest.json); do case "$n" in bridge|host|none) :;; *) docker network create "$n" >/dev/null 2>&1 || true;; esac; done
+if jq -e ".networks|length>0" manifest.json >/dev/null; then
+  for n in $(jq -r ".networks[]" manifest.json); do case "$n" in bridge|host|none) :;; *) docker network create "$n" >/dev/null 2>&1 || true;; esac; done
 fi
 
 say "[C] 回灌命名卷"
-if jq -e '.volumes|length>0' manifest.json >/dev/null; then
+if jq -e ".volumes|length>0" manifest.json >/dev/null; then
   mkdir -p volumes
   while IFS= read -r row; do
-    vname=$(jq -r '.name' <<<"$row"); file="vol_${vname}.tgz"
+    vname=$(jq -r ".name" <<<"$row"); file="vol_${vname}.tgz"
     [[ -f "volumes/$file" ]] || { warn "  跳过 $vname（缺少 volumes/$file）"; continue; }
     echo "  - ${vname}"
     docker volume create "$vname" >/dev/null 2>&1 || true
     docker run --rm -v "${vname}:/to" -v "$PWD/volumes:/from" alpine:3.20 sh -c "cd /to && tar -xzf /from/${file}"
-  done < <(jq -c '.volumes[]' manifest.json)
+  done < <(jq -c ".volumes[]" manifest.json)
 fi
 
 say "[D] 回灌绑定目录"
-if jq -e '.binds|length>0' manifest.json >/dev/null; then
+if jq -e ".binds|length>0" manifest.json >/dev/null; then
   mkdir -p binds
   while IFS= read -r row; do
-    host=$(jq -r '.host' <<<"$row"); file=$(jq -r '.file' <<<"$row")
+    host=$(jq -r ".host" <<<"$row"); file=$(jq -r ".file" <<<"$row")
     echo "  - ${host}"; mkdir -p "$host"; tar -C / -xzf "binds/${file}"
-  done < <(jq -c '.binds[]' manifest.json)
+  done < <(jq -c ".binds[]" manifest.json)
 fi
 
 say "[E] 恢复 Compose 项目"
-if jq -e '.projects|length>0' manifest.json >/dev/null; then
+if jq -e ".projects|length>0" manifest.json >/dev/null; then
   mkdir -p compose_restore
   while IFS= read -r row; do
-    name=$(jq -r '.name' <<<"$row"); echo "  - project: $name"; mkdir -p "compose_restore/${name}"
+    name=$(jq -r ".name" <<<"$row"); echo "  - project: $name"; mkdir -p "compose_restore/${name}"
     if compgen -G "compose/${name}/*.tgz" >/dev/null; then
       for t in compose/${name}/*.tgz; do tar -xzf "$t" -C "compose_restore/${name}" 2>/dev/null || true; done
     fi
     for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml .env docker-compose.override.yml compose.override.yaml; do
       [[ -f "compose/${name}/${f}" ]] && cp -a "compose/${name}/${f}" "compose_restore/${name}/${f}" || true
     done
+    NET="${name}_default"
     if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-      (cd "compose_restore/${name}" && docker compose down || true && docker compose up -d)
+      (cd "compose_restore/${name}" && docker compose down || true; docker network rm "$NET" >/dev/null 2>&1 || true; docker compose up -d)
     elif command -v docker-compose >/dev/null 2>&1; then
-      (cd "compose_restore/${name}" && docker-compose down || true && docker-compose up -d)
+      (cd "compose_restore/${name}" && docker-compose down || true; docker network rm "$NET" >/dev/null 2>&1 || true; docker-compose up -d)
     else
       warn "  新机未安装 docker compose/docker-compose，跳过该项目"
     fi
-  done < <(jq -c '.projects[]' manifest.json)
+  done < <(jq -c ".projects[]" manifest.json)
 fi
 
 say "[F] 恢复单容器（非 Compose）"
-if jq -e '.runs|length>0' manifest.json >/dev/null; then
-  for r in $(jq -r '.runs[]' manifest.json); do echo "  - $r"; bash "$r" || true; done
+if jq -e ".runs|length>0" manifest.json >/dev/null; then
+  for r in $(jq -r ".runs[]" manifest.json); do echo "  - $r"; bash "$r" || true; done
 fi
 
 say "[G] 完成，当前容器："
-docker ps --format '  {{.Names}}\t{{.Status}}\t{{.Ports}}'
+docker ps --format "  {{.Names}}\t{{.Status}}\t{{.Ports}}"
 echo "提示：若端口被占用，请编辑 compose 或 runs 脚本后再次执行。"
 REST_SH
-chmod +x "${BUNDLE}/restore.sh"
+  chmod +x "'"${BUNDLE}"'/restore.sh"
+'
 
 # ---------- README ----------
 cat > "${BUNDLE}/README.txt" <<EOF
@@ -406,7 +460,6 @@ OK  "[OK] 生成完成：${BUNDLE}"
 BLUE "[INFO] 启动 HTTP 服务（python3 -m http.server ${PORT}）"
 cleanup_http(){ kill "${SHPID}" 2>/dev/null || true; }
 trap cleanup_http EXIT
-
 ( cd "${WORKDIR}/bundle" && python3 -m http.server "${PORT}" >/dev/null 2>&1 & )
 SHPID=$!; sleep 1
 
