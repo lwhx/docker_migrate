@@ -1,406 +1,1004 @@
 #!/usr/bin/env bash
-# docker_migrate_perfect.sh — 处理 Docker 容器备份与恢复的脚本
+# docker_migrate_perfect.sh — Docker 容器一键迁移（源服务器使用）
+#
+# 功能概要：
+#   1. 自动检测并安装依赖（docker / jq / python3 / tar / gzip / curl）
+#   2. 按“独立容器 / docker compose 容器组”展示并选择要迁移的容器
+#   3. 打包：镜像、命名卷、绑定目录、（可用的）Compose 配置
+#   4. 生成 manifest.json 和 restore.sh
+#   5. 启动带安全随机路径的 HTTP 服务，输出下载链接；退出时关闭 HTTP、重启停机容器、清理临时文件
+#
+# 环境变量：
+#   PORT=8080            # 默认 HTTP 端口（会询问你要不要改；被占用则向后尝试）
+#   ADVERTISE_HOST=IP    # 下载链接里使用的域名/IP（默认自动探测）
+#
+# 参数：
+#   --no-stop            # 不停机备份（可能不一致，数据库慎用）
+#   --include=name1,...  # 按容器名称精确匹配，只迁移指定容器（不使用分组菜单）
+
 set -euo pipefail
 
-# ---------- Auto install deps ----------
-asudo(){ if [[ $EUID -ne 0 ]]; then sudo "$@"; else "$@"; fi; }
-pm_detect(){ if command -v apt-get >/dev/null 2>&1; then echo apt; return; fi
-             if command -v dnf     >/dev/null 2>&1; then echo dnf; return; fi
-             if command -v yum     >/dev/null 2>&1; then echo yum; return; fi
-             if command -v zypper  >/dev/null 2>&1; then echo zypper; return; fi
-             if command -v apk     >/dev/null 2>&1; then echo apk; return; fi
-             echo none; }
-pm_install(){
+#####################################
+#  基础函数 & 依赖管理
+#####################################
+
+BLUE(){ echo -e "\033[1;34m$*\033[0m"; }
+YEL(){  echo -e "\033[1;33m$*\033[0m"; }
+RED(){  echo -e "\033[1;31m$*\033[0m"; }
+OK(){   echo -e "\033[1;32m$*\033[0m"; }
+
+asudo() {
+  if [[ $EUID -ne 0 ]]; then
+    sudo "$@"
+  else
+    "$@"
+  fi
+}
+
+pm_detect() {
+  if command -v apt-get >/dev/null 2>&1; then echo apt; return; fi
+  if command -v dnf     >/dev/null 2>&1; then echo dnf; return; fi
+  if command -v yum     >/dev/null 2>&1; then echo yum; return; fi
+  if command -v zypper  >/dev/null 2>&1; then echo zypper; return; fi
+  if command -v apk     >/dev/null 2>&1; then echo apk; return; fi
+  echo none
+}
+
+pm_install() {
   local pm="$1"; shift
   case "$pm" in
-    apt)    asudo apt-get update -y; asudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@";;
-    dnf)    asudo dnf install -y "$@";;
-    yum)    asudo yum install -y "$@";;
-    zypper) asudo zypper --non-interactive install -y "$@";;
-    apk)    asudo apk add --no-cache "$@";;
-    *) echo "[ERR] 无法识别包管理器，手动安装：$*"; exit 1;;
+    apt)
+      asudo apt-get update -y
+      asudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+      ;;
+    dnf)    asudo dnf install -y "$@" ;;
+    yum)    asudo yum install -y "$@" ;;
+    zypper) asudo zypper --non-interactive install -y "$@" ;;
+    apk)    asudo apk add --no-cache "$@" ;;
+    *)
+      RED "[ERR] 不支持的包管理器：$pm，请手动安装：$*"
+      exit 1
+      ;;
   esac
 }
-need_bin(){ local b="$1" p="$2"; command -v "$b" >/dev/null 2>&1 || { echo "[INFO] 安装依赖：$b"; pm_install "$PKGMGR" $p; }; }
-ensure_docker_running(){
-  if ! command -v docker >/dev/null 2>&1; then return; fi
-  if docker info >/dev/null 2>&1; then return; fi
-  echo "[INFO] 启动 Docker 服务..."
-  if command -v systemctl >/dev/null 2>&1; then asudo systemctl enable --now docker || true; fi
-  if ! docker info >/dev/null 2>&1 && command -v service >/dev/null 2>&1; then asudo service docker start || true; fi
-  if ! docker info >/dev/null 2>&1; then
-    echo "[WARN] 尝试直接拉起 dockerd（后台）"
-    if command -v dockerd >/dev/null 2>&1; then (asudo nohup dockerd >/var/log/dockerd.migrate.log 2>&1 &); sleep 2; fi
+
+need_bin() {
+  local bin="$1" pkg="$2"
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    echo "[INFO] 安装依赖：$bin"
+    pm_install "$PKGMGR" "$pkg"
   fi
-  docker info >/dev/null 2>&1 || { echo "[ERR] Docker 未成功启动，请手动检查"; exit 1; }
 }
 
-PKGMGR="$(pm_detect)"
-if [[ "$PKGMGR" == "none" ]]; then
-  echo "[ERR] 未检测到 apt/dnf/yum/zypper/apk，请手动安装依赖：docker jq python3 tar gzip curl"
-  exit 1
-fi
+ensure_docker_running() {
+  if ! command -v docker >/dev/null 2>&1; then
+    RED "[ERR] 未检测到 docker，请先安装 Docker 再运行本脚本。"
+    exit 1
+  fi
 
-case "$PKGMGR" in
-  apt) need_bin curl curl; need_bin jq jq; need_bin python3 python3; need_bin tar tar; need_bin gzip gzip; need_bin docker docker.io;;
-  yum|dnf)
-    need_bin curl curl; need_bin jq jq; need_bin python3 python3; need_bin tar tar; need_bin gzip gzip
-    if ! command -v docker >/dev/null 2>&1; then pm_install "$PKGMGR" docker || pm_install "$PKGMGR" docker-ce || true; fi;;
-  zypper) need_bin curl curl; need_bin jq jq; need_bin python3 python3; need_bin tar tar; need_bin gzip gzip; need_bin docker docker;;
-  apk)    need_bin curl curl; need_bin jq jq; need_bin python3 python3; need_bin tar tar; need_bin gzip gzip; need_bin docker docker;;
-esac
-ensure_docker_running
+  if docker info >/dev/null 2>&1; then
+    return
+  fi
 
-# ---------- UI helpers ----------
-BLUE(){ echo -e "\033[1;34m$*\033[0m"; }
-YEL(){ echo -e "\033[1;33m$*\033[0m"; }
-RED(){ echo -e "\033[1;31m$*\033[0m"; }
-OK(){  echo -e "\033[1;32m$*\033[0m"; }
+  YEL "[INFO] 尝试启动 Docker 服务..."
+  if command -v systemctl >/dev/null 2>&1; then
+    asudo systemctl enable --now docker || true
+  fi
+  if ! docker info >/dev/null 2>&1 && command -v service >/dev/null 2>&1; then
+    asudo service docker start || true
+  fi
 
-human(){ # bytes -> human
-  local b=$1; local u=(B KB MB GB TB PB); local i=0
-  while (( b>=1024 && i<${#u[@]}-1 )); do b=$((b/1024)); i=$((i+1)); done
+  if ! docker info >/dev/null 2>&1; then
+    YEL "[WARN] 尝试后台直接启动 dockerd ..."
+    if command -v dockerd >/dev/null 2>&1; then
+      asudo nohup dockerd >/var/log/dockerd.migrate.log 2>&1 &
+      sleep 3
+    fi
+  fi
+
+  if ! docker info >/dev/null 2>&1; then
+    RED "[ERR] Docker 仍未正常启动，请手动检查后重试。"
+    exit 1
+  fi
+}
+
+human() {
+  local b=$1
+  local u=(B KB MB GB TB PB)
+  local i=0
+  while (( b >= 1024 && i < ${#u[@]}-1 )); do
+    b=$((b/1024))
+    i=$((i+1))
+  done
   echo "${b}${u[$i]}"
 }
 
-spinner_run(){ local msg="$1"; shift; local spin='-\|/' i=0
+spinner_run() {
+  local msg="$1"; shift
+  local spin='-\|/' i=0
   printf "%s " "$msg"
-  ( "$@" ) & local cmd_pid=$!
-  while kill -0 "$cmd_pid" 2>/dev/null; do i=$(( (i+1)%4 )); printf "\r%s %s" "$msg" "${spin:$i:1}"; sleep 0.15; done
-  wait "$cmd_pid"; printf "\r%s 完成\n" "$msg"
+  (
+    "$@"
+  ) &
+  local cmd_pid=$!
+
+  while kill -0 "$cmd_pid" 2>/dev/null; do
+    i=$(( (i+1) % 4 ))
+    printf "\r%s %s" "$msg" "${spin:$i:1}"
+    sleep 0.15
+  done
+
+  local rc=0
+  if ! wait "$cmd_pid"; then
+    rc=$?
+  fi
+
+  if (( rc == 0 )); then
+    printf "\r%s 完成\n" "$msg"
+  else
+    printf "\r%s 失败 (exit=%d)\n" "$msg" "$rc"
+  fi
+  return "$rc"
 }
 
-# --- images.tar 进度（pv优先，其次stat轮询） ---
-progress_docker_save(){
+progress_docker_save() {
   local outfile="$1"; shift
+  local rc=0
+
   if command -v pv >/dev/null 2>&1; then
-    "$@" | pv -b > "$outfile"
+    BLUE "[INFO] 保存镜像 images.tar （使用 pv 显示进度）..."
+    if ! "$@" | pv -b > "$outfile"; then
+      rc=$?
+    fi
+    local cur
+    cur=$(stat -c %s "$outfile" 2>/dev/null || echo 0)
+    echo "[进度] images.tar 完成：$(human "$cur")"
   else
+    BLUE "[INFO] 保存镜像 images.tar （此步骤可能较久，请耐心等待）..."
     "$@" > "$outfile" &
     local pid=$!
     local last=0 cur=0
+    local spin='-/|\' i=0
+
     printf "[进度] images.tar "
     while kill -0 "$pid" 2>/dev/null; do
       if [[ -f "$outfile" ]]; then
         cur=$(stat -c %s "$outfile" 2>/dev/null || echo 0)
-        if (( cur!=last )); then
-          printf "\r[进度] images.tar 已写入：%s" "$(human "$cur")"
+        if (( cur != last )); then
+          printf "\r[进度] images.tar %c 已写入：%s" "${spin:$i:1}" "$(human "$cur")"
           last=$cur
         else
-          printf "\r[进度] images.tar 写入中 ..."
+          printf "\r[进度] images.tar %c 写入中 ..." "${spin:$i:1}"
         fi
       else
-        printf "\r[进度] images.tar 准备中 ..."
+        printf "\r[进度] images.tar %c 准备中 ..." "${spin:$i:1}"
       fi
+      i=$(( (i+1) % 4 ))
       sleep 1
     done
-    wait "$pid" || true
+
+    if ! wait "$pid"; then
+      rc=$?
+    fi
     cur=$(stat -c %s "$outfile" 2>/dev/null || echo 0)
-    printf "\r[进度] images.tar 完成：%s\n" "$(human "$cur")"
+    printf "\r%-80s\r" ""
+    echo "[进度] images.tar 完成：$(human "$cur")"
   fi
+
+  return "$rc"
 }
 
-# ---------- IP / URL（只输出一个最终URL，公网优先） ---
-is_private_ipv4(){ local ip="$1"
-  [[ "$ip" =~ ^10\.|^192\.168\.|^172\.(1[6-9]|2[0-9]|3[0-1])\.|^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|^127\.|^169\.254\. ]] && return 0 || return 1; }
-get_public_ip_external(){ local ip
+is_private_ipv4() {
+  local ip="$1"
+  [[ "$ip" =~ ^10\.|^192\.168\.|^172\.(1[6-9]|2[0-9]|3[0-1])\.|^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|^127\.|^169\.254\. ]]
+}
+
+get_public_ip_external() {
+  local ip
   for svc in https://api.ipify.org https://ipv4.icanhazip.com https://ifconfig.me; do
     ip="$(curl -fsS --max-time 2 "$svc" 2>/dev/null | tr -d '\r\n' || true)"
-    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "$ip"; return 0; }
-  done; return 1; }
-pick_advertise_url(){
-  local port="$1" rid="$2" host=""
-  if [[ -n "${ADVERTISE_HOST:-}" ]]; then host="$ADVERTISE_HOST"
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      echo "$ip"
+      return 0
+    fi
+  done
+  return 1
+}
+
+pick_advertise_url() {
+  local port="$1"
+  local _rid_unused="${2:-}"
+  local host=""
+
+  if [[ -n "${ADVERTISE_HOST:-}" ]]; then
+    host="$ADVERTISE_HOST"
   else
-    local via_route; via_route="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
-    if [[ -n "$via_route" ]] && ! is_private_ipv4 "$via_route"; then host="$via_route"; fi
+    local via_route
+    via_route="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+    if [[ -n "$via_route" ]] && ! is_private_ipv4 "$via_route"; then
+      host="$via_route"
+    fi
     [[ -z "$host" ]] && host="$(get_public_ip_external || true)"
     [[ -z "$host" ]] && host="$(ip -4 -o addr show 2>/dev/null | awk '!/ lo| docker| veth| br-| kube/ {print $4}' | cut -d/ -f1 | head -n1)"
     : "${host:=127.0.0.1}"
   fi
-  echo "http://${host}:${port}/${rid}.tar.gz"
+  echo "http://${host}:${port}"
 }
 
-pick_free_port(){ local p="${1:-8080}"; for _ in $(seq 0 50); do ss -lnt 2>/dev/null|awk '{print $4}'|grep -q ":$p$"||{ echo "$p"; return; }; p=$((p+1)); done; echo "$1"; }
+pick_free_port() {
+  local p="${1:-8080}" i
+  for i in $(seq 0 50); do
+    if command -v ss >/dev/null 2>&1; then
+      if ! ss -lnt 2>/dev/null | awk '{print $4}' | grep -q ":$p$"; then
+        echo "$p"; return 0
+      fi
+    elif command -v netstat >/dev/null 2>&1; then
+      if ! netstat -lnt 2>/dev/null | awk '{print $4}' | grep -q ":$p$"; then
+        echo "$p"; return 0
+      fi
+    else
+      echo "$p"; return 0
+    fi
+    p=$((p+1))
+  done
+  echo "${1:-8080}"
+}
 
-# ---------- Args ----------
-NO_STOP="0"; INCLUDE_LIST=""
-for arg in "$@"; do
-  case "$arg" in
-    --no-stop) NO_STOP="1" ;;
-    --include=*) INCLUDE_LIST="${arg#*=}" ;;
-    --include) shift; INCLUDE_LIST="${1:-}" ;;
+#####################################
+#  依赖检测 / 安装
+#####################################
+
+PKGMGR="$(pm_detect)"
+if [[ "$PKGMGR" == "none" ]]; then
+  RED "[ERR] 未检测到 apt/dnf/yum/zypper/apk，请手动安装：docker jq python3 tar gzip curl"
+  exit 1
+fi
+
+case "$PKGMGR" in
+  apt)
+    need_bin curl curl
+    need_bin jq jq
+    need_bin python3 python3
+    need_bin tar tar
+    need_bin gzip gzip
+    need_bin docker docker.io
+    ;;
+  yum|dnf)
+    need_bin curl curl
+    need_bin jq jq
+    need_bin python3 python3
+    need_bin tar tar
+    need_bin gzip gzip
+    if ! command -v docker >/dev/null 2>&1; then
+      pm_install "$PKGMGR" docker || pm_install "$PKGMGR" docker-ce || true
+    fi
+    ;;
+  zypper)
+    need_bin curl curl
+    need_bin jq jq
+    need_bin python3 python3
+    need_bin tar tar
+    need_bin gzip gzip
+    need_bin docker docker
+    ;;
+  apk)
+    need_bin curl curl
+    need_bin jq jq
+    need_bin python3 python3
+    need_bin tar tar
+    need_bin gzip gzip
+    need_bin docker docker
+    ;;
+esac
+
+ensure_docker_running
+
+#####################################
+#  参数解析
+#####################################
+
+NO_STOP=0
+INCLUDE_LIST=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-stop)   NO_STOP=1; shift;;
+    --include=*) INCLUDE_LIST="${1#*=}"; shift;;
+    --include)   shift; INCLUDE_LIST="${1:-}"; [[ $# -gt 0 ]] && shift || true;;
     -h|--help)
-cat <<'HLP'
+      cat <<'HLP'
 用法:
   bash docker_migrate_perfect.sh [--no-stop] [--include=name1,name2]
+
 环境变量:
   PORT=8080            # HTTP 端口（默认 8080；被占用会自动递增）
-  ADVERTISE_HOST=IP    # 用于生成下载链接（优先级最高）
+  ADVERTISE_HOST=IP    # 下载链接中使用的主机名/IP
+
+说明:
+  - 在旧服务器上运行本脚本。
+  - 如不指定 --include，将进入交互式菜单：
+      * 独立 docker 容器：每个容器一个序号
+      * docker compose 容器组：同一个 compose 项目中的所有容器共享一个序号
+    选择某个组时，会把该组内所有容器一并迁移。
+  - 打包完成后会启动 HTTP 服务并给出下载链接（带安全随机路径）。
+  - 新服务器上请使用 auto_restore.sh 进行恢复。
 HLP
       exit 0;;
+    *)
+      RED "[ERR] 未知参数：$1"
+      exit 1;;
   esac
 done
 
-# ---------- dirs & ids ----------
-PORT="$(pick_free_port "${PORT:-8080}")"
-WORKDIR="$(pwd)"; STAMP="$(date +%Y%m%d-%H%M%S)"
+#####################################
+#  Bundle 路径与 ID
+#####################################
+
+DEFAULT_PORT="${PORT:-8080}"
+PORT="$(pick_free_port "$DEFAULT_PORT")"
+
+WORKDIR="$(pwd)"
+STAMP="$(date +%Y%m%d-%H%M%S)"
 RID="$(head -c 12 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 10)"
-BUNDLE="${WORKDIR}/bundle/${RID}"
+
+BUNDLE_ROOT="${WORKDIR}/bundle"
+BUNDLE="${BUNDLE_ROOT}/${RID}"
+
 mkdir -p "${BUNDLE}"/{runs,volumes,binds,compose,meta}
-BLUE "[INFO] Bundle: ${BUNDLE}"
+BLUE "[INFO] Bundle 目录：${BUNDLE}"
 
-# ---------- select containers ----------
-mapfile -t ALL_IDS < <(docker ps --format '{{.ID}}')
-((${#ALL_IDS[@]})) || { RED "[ERR] 没有运行中的容器"; exit 1; }
+#####################################
+#  容器选择（支持 compose 分组）
+#####################################
 
-declare -a IDS
+declare -a IDS   # 最终选择的容器 ID 列表
+
 if [[ -n "$INCLUDE_LIST" ]]; then
+  mapfile -t ALL_IDS < <(docker ps --format '{{.ID}}')
+  ((${#ALL_IDS[@]})) || { RED "[ERR] 没有运行中的容器"; exit 1; }
+
   IFS=',' read -r -a NAMES <<<"$INCLUDE_LIST"
-  for n in "${NAMES[@]}"; do n="$(echo "$n"|xargs)"; id=$(docker ps --filter "name=^${n}$" --format '{{.ID}}' | head -n1 || true)
-    [[ -n "$id" ]] && IDS+=("$id") || YEL "[WARN] 未找到容器：$n"; done
+  for n in "${NAMES[@]}"; do
+    n="$(echo "$n" | xargs)"
+    [[ -z "$n" ]] && continue
+    id=$(docker ps --filter "name=^${n}$" --format '{{.ID}}' | head -n1 || true)
+    if [[ -n "$id" ]]; then
+      IDS+=("$id")
+    else
+      YEL "[WARN] 未找到容器：$n"
+    fi
+  done
   ((${#IDS[@]})) || { RED "[ERR] --include 未匹配到任何容器"; exit 1; }
+
 else
-  BLUE "[INFO] 当前运行容器："; docker ps --format '  {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
-  read -rp $'\n请选择容器 [回车=全部 / 或输入逗号分隔的名字]： ' PICK
-  if [[ -z "$PICK" ]]; then IDS=("${ALL_IDS[@]}"); else
-    IFS=',' read -r -a NAMES <<<"$PICK"
-    for n in "${NAMES[@]}"; do n="$(echo "$n"|xargs)"; id=$(docker ps --filter "name=^${n}$" --format '{{.ID}}' | head -n1 || true)
-      [[ -n "$id" ]] && IDS+=("$id") || YEL "[WARN] 未找到容器：$n"; done
+  mapfile -t PS_LINES < <(docker ps --format '{{.ID}} {{.Names}}')
+  ((${#PS_LINES[@]})) || { RED "[ERR] 没有运行中的容器"; exit 1; }
+
+  declare -a STANDALONE_IDS STANDALONE_NAMES
+  declare -A NAME_OF_ID
+  declare -A GROUP_IDS GROUP_LABELS GROUP_SEEN
+  declare -a GROUP_KEYS
+
+  for line in "${PS_LINES[@]}"; do
+    id="${line%% *}"
+    cname="${line#* }"
+    [[ -z "$cname" || "$cname" == "$id" ]] && cname="$id"
+    NAME_OF_ID["$id"]="$cname"
+
+    j="$(docker inspect "$id")"
+
+    proj=$(jq -r '.[0].Config.Labels["com.docker.compose.project"] // empty' <<<"$j")
+    wdir=$(jq -r '.[0].Config.Labels["com.docker.compose.project.working_dir"] // empty' <<<"$j")
+
+    if [[ -n "$proj" && -n "$wdir" ]]; then
+      key="${proj}|${wdir}"
+      if [[ -z "${GROUP_SEEN[$key]:-}" ]]; then
+        GROUP_SEEN["$key"]=1
+        GROUP_IDS["$key"]="$id"
+        GROUP_LABELS["$key"]="$cname"
+        GROUP_KEYS+=("$key")
+      else
+        GROUP_IDS["$key"]="${GROUP_IDS[$key]} $id"
+        GROUP_LABELS["$key"]="${GROUP_LABELS[$key]} $cname"
+      fi
+    else
+      STANDALONE_IDS+=("$id")
+      STANDALONE_NAMES+=("$cname")
+    fi
+  done
+
+  # 只有一个容器的 compose 项目归类为“独立容器”
+  if ((${#GROUP_KEYS[@]})); then
+    declare -a TRUE_GROUP_KEYS=()
+    for key in "${GROUP_KEYS[@]}"; do
+      local_cnt=0
+      for cid in ${GROUP_IDS[$key]}; do
+        local_cnt=$((local_cnt+1))
+      done
+      if (( local_cnt > 1 )); then
+        TRUE_GROUP_KEYS+=("$key")
+      else
+        for cid in ${GROUP_IDS[$key]}; do
+          STANDALONE_IDS+=("$cid")
+          STANDALONE_NAMES+=("${NAME_OF_ID[$cid]}")
+        done
+      fi
+    done
+    GROUP_KEYS=("${TRUE_GROUP_KEYS[@]}")
+  fi
+
+  declare -a MENU_KIND MENU_VAL
+  idx=0
+
+  if ((${#STANDALONE_IDS[@]})); then
+    BLUE "独立 docker 容器："
+    for i in "${!STANDALONE_IDS[@]}"; do
+      idx=$((idx+1))
+      id="${STANDALONE_IDS[$i]}"
+      name="${STANDALONE_NAMES[$i]}"
+      printf "  %2d) %s\n" "$idx" "$name"
+      MENU_KIND[$idx]="single"
+      MENU_VAL[$idx]="$id"
+    done
+    echo ""
+  fi
+
+  if ((${#GROUP_KEYS[@]})); then
+    BLUE "docker compose 容器组："
+    for key in "${GROUP_KEYS[@]}"; do
+      idx=$((idx+1))
+      label_display=""
+      for cname in ${GROUP_LABELS[$key]}; do
+        label_display+="【${cname}】"
+      done
+      printf "  %2d) %s\n" "$idx" "$label_display"
+      MENU_KIND[$idx]="compose"
+      MENU_VAL[$idx]="$key"
+    done
+    echo ""
+  fi
+
+  if (( idx == 0 )); then
+    RED "[ERR] 没有运行中的容器"
+    exit 1
+  fi
+
+  read -rp "请输入要迁移的序号 [回车=全部 / 逗号分隔，如 1,3]： " PICK
+  if [[ -z "$PICK" ]]; then
+    IDS=("${STANDALONE_IDS[@]}")
+    for key in "${GROUP_KEYS[@]}"; do
+      for cid in ${GROUP_IDS[$key]}; do
+        IDS+=("$cid")
+      done
+    done
+  else
+    IFS=',' read -r -a INDEX_LIST <<<"$PICK"
+    declare -A SEEN_ID
+
+    for t in "${INDEX_LIST[@]}"; do
+      t="$(echo "$t" | xargs)"
+      [[ -z "$t" ]] && continue
+      if ! [[ "$t" =~ ^[0-9]+$ ]]; then
+        YEL "[WARN] 非法序号：$t"
+        continue
+      fi
+      num="$t"
+      if (( num < 1 || num > idx )); then
+        YEL "[WARN] 序号越界：$t"
+        continue
+      fi
+      kind="${MENU_KIND[$num]}"
+      val="${MENU_VAL[$num]}"
+      if [[ "$kind" == "single" ]]; then
+        cid="$val"
+        if [[ -z "${SEEN_ID[$cid]:-}" ]]; then
+          SEEN_ID["$cid"]=1
+          IDS+=("$cid")
+        fi
+      elif [[ "$kind" == "compose" ]]; then
+        for cid in ${GROUP_IDS[$val]}; do
+          if [[ -z "${SEEN_ID[$cid]:-}" ]]; then
+            SEEN_ID["$cid"]=1
+            IDS+=("$cid")
+          fi
+        done
+      fi
+    done
     ((${#IDS[@]})) || { RED "[ERR] 未选择任何容器"; exit 1; }
   fi
 fi
 
-# ---------- discovery ----------
-BLUE "[INFO] 采集元数据 ..."
-declare -A IMGSET=() NETWORKS=() CONTAINER_NAME=() CONTAINER_IS_COMPOSE=()
-declare -A PROJECT_KEY_OF=() COMPOSE_GROUP=() COMPOSE_CFGS=() SINGLETONS=()
+#####################################
+#  元数据采集
+#####################################
+
+BLUE "[INFO] 采集容器元数据 ..."
+
+declare -A IMGSET=()
+declare -A NETWORKS=()
+declare -A CONTAINER_NAME=()
+declare -A CONTAINER_IS_COMPOSE=()
+declare -A PROJECT_KEY_OF=()
+declare -A COMPOSE_GROUP=()
+declare -A COMPOSE_CFGS=()
+declare -A SINGLETONS=()
 
 for id in "${IDS[@]}"; do
   j="$(docker inspect "$id")"
-  name=$(jq -r '.[0].Name|ltrimstr("/")' <<<"$j")
+  name=$(jq -r '.[0].Name | ltrimstr("/")' <<<"$j")
   img=$(jq -r '.[0].Config.Image' <<<"$j")
-  IMGSET["$img"]=1; CONTAINER_NAME["$id"]="$name"
-  mapfile -t nets < <(jq -r '.[0].NetworkSettings.Networks|keys[]?' <<<"$j" || true)
-  for n in "${nets[@]}"; do case "$n" in bridge|host|none) :;; *) NETWORKS["$n"]=1;; esac; done
+
+  CONTAINER_NAME["$id"]="$name"
+  IMGSET["$img"]=1
+
+  mapfile -t nets < <(jq -r '.[0].NetworkSettings.Networks | keys[]?' <<<"$j" || true)
+  for n in "${nets[@]}"; do
+    case "$n" in
+      bridge|host|none) : ;;
+      *) NETWORKS["$n"]=1 ;;
+    esac
+  done
+
   proj=$(jq -r '.[0].Config.Labels["com.docker.compose.project"] // empty' <<<"$j")
   wdir=$(jq -r '.[0].Config.Labels["com.docker.compose.project.working_dir"] // empty' <<<"$j")
   cfgs=$(jq -r '.[0].Config.Labels["com.docker.compose.project.config_files"] // empty' <<<"$j")
+
   if [[ -n "$proj" && -n "$wdir" ]]; then
-    key="${proj}|${wdir}"; COMPOSE_GROUP["$key"]=1; [[ -n "$cfgs" ]] && COMPOSE_CFGS["$key"]="$cfgs"
-    PROJECT_KEY_OF["$id"]="$key"; CONTAINER_IS_COMPOSE["$id"]=1
+    key="${proj}|${wdir}"
+    COMPOSE_GROUP["$key"]=1
+    [[ -n "$cfgs" ]] && COMPOSE_CFGS["$key"]="$cfgs"
+    PROJECT_KEY_OF["$id"]="$key"
+    CONTAINER_IS_COMPOSE["$id"]=1
   else
-    PROJECT_KEY_OF["$id"]=""; CONTAINER_IS_COMPOSE["$id"]=0; SINGLETONS["$name"]=1
+    PROJECT_KEY_OF["$id"]=""
+    CONTAINER_IS_COMPOSE["$id"]=0
+    SINGLETONS["$name"]=1
   fi
+
   echo "$j" > "${BUNDLE}/meta/${name}.inspect.json"
 done
 
-# ---------- stop window ----------
-STOPPED_ON_BACKUP=()
-if [[ "$NO_STOP" == "1" ]]; then
-  YEL "[WARN] --no-stop：不停机备份，可能不一致（数据库尤需注意）"
+#####################################
+#  打包 Compose 配置（绝对/相对路径）
+#####################################
+
+if ((${#COMPOSE_GROUP[@]})); then
+  BLUE "[INFO] 打包 docker compose 项目配置 ..."
+  for key in "${!COMPOSE_GROUP[@]}"; do
+    proj="${key%%|*}"
+    wdir="${key#*|}"
+    dest="${BUNDLE}/compose/${proj}"
+    mkdir -p "$dest"
+
+    cfgs="${COMPOSE_CFGS[$key]:-}"
+    if [[ -n "$cfgs" ]]; then
+      IFS=':' read -r -a CFG_ARR <<<"$cfgs"
+      for cfg in "${CFG_ARR[@]}"; do
+        cfg="${cfg#./}"
+        [[ -z "$cfg" ]] && continue
+        src=""
+        if [[ "$cfg" == /* ]]; then
+          src="$cfg"
+        elif [[ -n "$wdir" ]]; then
+          src="${wdir}/${cfg}"
+        else
+          src="$cfg"
+        fi
+        if [[ -f "$src" ]]; then
+          cp -a "$src" "$dest/" 2>/dev/null || true
+        fi
+      done
+    fi
+
+    # 常见文件名兜底（相对于 working_dir）
+    for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml .env docker-compose.override.yml compose.override.yaml; do
+      if [[ -n "$wdir" && -f "${wdir}/${f}" ]]; then
+        cp -a "${wdir}/${f}" "$dest/" 2>/dev/null || true
+      fi
+    done
+  done
+fi
+
+#####################################
+#  停机窗口（可选）
+#####################################
+
+declare -a STOPPED_ON_BACKUP=()
+
+if (( NO_STOP == 1 )); then
+  YEL "[WARN] 使用 --no-stop：不停机备份，数据可能不一致（尤其数据库类容器）。"
 else
-  read -rp "是否现在停机以确保一致性备份？[Y/n] " STOPNOW; STOPNOW=${STOPNOW:-Y}
+  read -rp "是否现在停机以确保一致性备份？[Y/n] " STOPNOW
+  STOPNOW=${STOPNOW:-Y}
   if [[ "$STOPNOW" =~ ^[Yy]$ ]]; then
-    total=${#IDS[@]}; idx=0
+    total_count=${#IDS[@]}
+    idx=0
     for id in "${IDS[@]}"; do
-      idx=$((idx+1)); n="${CONTAINER_NAME[$id]}"
-      printf "[停机] (%d/%d) %s ..." "$idx" "$total" "$n"
+      idx=$((idx+1))
+      n="${CONTAINER_NAME[$id]}"
+      printf "[停机] (%d/%d) %s ..." "$idx" "$total_count" "$n"
       if docker stop "$n" >/dev/null 2>&1; then
-        STOPPED_ON_BACKUP+=("$n"); printf " ok\n"
+        STOPPED_ON_BACKUP+=("$n")
+        printf " ok\n"
       else
         printf " fail\n"
       fi
     done
   else
-    YEL "[WARN] 你选择了不停机备份"
+    YEL "[WARN] 你选择了不停机备份。"
   fi
 fi
 
-# ---------- pack volumes & binds ----------
+#####################################
+#  备份卷与绑定目录
+#####################################
+
 BLUE "[INFO] 备份卷与绑定目录 ..."
-declare -a MAN_VOL=() MAN_BIND=()
-# 预统计总数
-vol_count=0; bind_count=0
+
+declare -a MAN_VOL=()
+declare -a MAN_BIND=()
+
+vol_count=0
+bind_count=0
+
 for id in "${IDS[@]}"; do
-  n="${CONTAINER_NAME[$id]}"; j="$(cat "${BUNDLE}/meta/${n}.inspect.json")"
+  n="${CONTAINER_NAME[$id]}"
+  j="$(cat "${BUNDLE}/meta/${n}.inspect.json")"
   vol_count=$((vol_count + $(jq -r '.[0].Mounts[]? | select(.Type=="volume") | 1' <<<"$j" | wc -l || echo 0)))
   bind_count=$((bind_count + $(jq -r '.[0].Mounts[]? | select(.Type=="bind")   | 1' <<<"$j" | wc -l || echo 0)))
 done
-v_idx=0; b_idx=0
 
-# ---------- 处理卷与绑定目录 ----------
+v_idx=0
+b_idx=0
+
 for id in "${IDS[@]}"; do
-  n="${CONTAINER_NAME[$id]}"; j="$(cat "${BUNDLE}/meta/${n}.inspect.json")"
-  while IFS= read -r m; do [[ -z "$m" ]] && continue
-    t=$(jq -r '.Type' <<<"$m"); dest=$(jq -r '.Destination' <<<"$m")
+  n="${CONTAINER_NAME[$id]}"
+  j="$(cat "${BUNDLE}/meta/${n}.inspect.json")"
+
+  while IFS= read -r m; do
+    [[ -z "$m" ]] && continue
+    t=$(jq -r '.Type' <<<"$m")
+    dest=$(jq -r '.Destination' <<<"$m")
+
     case "$t" in
       volume)
         v_idx=$((v_idx+1))
-        vname=$(jq -r '.Name' <<<"$m"); printf "  [VOL] (%d/%d) %s :: %s -> %s\n" "$v_idx" "$vol_count" "$n" "$vname" "$dest"
+        vname=$(jq -r '.Name' <<<"$m")
+        printf "  [VOL]  (%d/%d) %s :: %s -> %s\n" "$v_idx" "$vol_count" "$n" "$vname" "$dest"
+        mkdir -p "${BUNDLE}/volumes"
         out="${BUNDLE}/volumes/vol_${vname}.tgz"
-        docker run --rm -v "${vname}:/from:ro" -v "${BUNDLE}/volumes:/to" alpine:3.20 sh -c "cd /from && tar -czf /to/$(basename "$out") ."
-        MAN_VOL+=("{\"name\":\"${vname}\",\"dest\":\"${dest}\"}") ;;
+        docker run --rm \
+          -v "${vname}:/from:ro" \
+          -v "${BUNDLE}/volumes:/to" \
+          alpine:3.20 sh -c "cd /from && tar -czf /to/$(basename "$out") ." || {
+            YEL "    [WARN] 打包卷失败：$vname"
+            continue
+          }
+        MAN_VOL+=("{\"name\":\"${vname}\",\"dest\":\"${dest}\"}")
+        ;;
       bind)
         b_idx=$((b_idx+1))
-        src=$(jq -r '.Source' <<<"$m"); esc=$(echo "$src"|sed 's#/#_#g'|sed 's/^_//'); out="${BUNDLE}/binds/bind_${esc}.tgz"
+        src=$(jq -r '.Source' <<<"$m")
+        esc=$(echo "$src" | sed 's#/#_#g' | sed 's/^_//')
+        out="${BUNDLE}/binds/bind_${esc}.tgz"
         printf "  [BIND] (%d/%d) %s :: %s -> %s\n" "$b_idx" "$bind_count" "$n" "$src" "$dest"
-        mkdir -p "$(dirname "$out")"
-        tar -C / -czf "$out" "${src#/}" 2>/dev/null || { YEL "    跳过不可读路径：$src"; continue; }
-        MAN_BIND+=("{\"host\":\"${src}\",\"dest\":\"${dest}\",\"file\":\"$(basename "$out")\"}") ;;
-      *) YEL "  [SKIP] mount=$t dest=$dest" ;;
+        mkdir -p "${BUNDLE}/binds"
+        if ! tar -C / -czf "$out" "${src#/}" 2>/dev/null; then
+          YEL "    [WARN] 跳过不可读路径：$src"
+          continue
+        fi
+        MAN_BIND+=("{\"host\":\"${src}\",\"dest\":\"${dest}\",\"file\":\"$(basename "$out")\"}")
+        ;;
+      *)
+        YEL "  [SKIP] 未处理的 mount 类型：$t (dest=$dest)"
+        ;;
     esac
   done < <(jq -c '.[0].Mounts[]?' <<<"$j")
 done
 
-# -------- save images（带实时进度） --------
-BLUE "[INFO] 保存镜像 images.tar ..."
+#####################################
+#  保存镜像 images.tar
+#####################################
+
 mapfile -t IMAGES < <(printf "%s\n" "${!IMGSET[@]}" | sort -u)
+
 if ((${#IMAGES[@]})); then
   OUT_IMG="${BUNDLE}/images.tar"
-  progress_docker_save "${OUT_IMG}" docker image save "${IMAGES[@]}"
-  OK "[OK] images.tar 已生成，大小：$(du -h "${OUT_IMG}" | awk '{print $1}')"
+  if progress_docker_save "${OUT_IMG}" docker image save "${IMAGES[@]}"; then
+    OK "[OK] images.tar 已生成，大小：$(du -h "${OUT_IMG}" | awk '{print $1}')"
+  else
+    RED "[ERR] docker image save 失败，请检查磁盘空间或 Docker 状态。"
+  fi
 else
-  YEL "[WARN] 未收集到镜像名？"
+  YEL "[WARN] 未收集到镜像名（可能是只用了本地 none 镜像）。"
 fi
 
-# -------- 生成 manifest.json 与 restore.sh --------
-generate_manifest_and_restore(){
-  mapfile -t NETLIST < <(printf "%s\n" "${!NETWORKS[@]}" | sort -u)
+#####################################
+#  生成 manifest.json 与 restore.sh
+#####################################
+
+declare -a RUNS=()   # 预留：未来可以为非 compose 容器生成 run 脚本
+
+generate_manifest_and_restore() {
+  mapfile -t NETLIST2 < <(printf "%s\n" "${!NETWORKS[@]}" | sort -u)
+
   declare -a MAN_PROJECTS=()
+  local key
   for key in "${!COMPOSE_GROUP[@]}"; do
-    proj="${key%%|*}"; wdir="${key#*|}"
-    files_json="[]"
+    local proj="${key%%|*}"
+    local wdir="${key#*|}"
+
+    local files_json="[]"
     if ls -1 "${BUNDLE}/compose/${proj}/" >/dev/null 2>&1; then
       mapfile -t FLS < <(ls -1 "${BUNDLE}/compose/${proj}/" 2>/dev/null || true)
-      ((${#FLS[@]})) && files_json=$(printf "\"%s\"," "${FLS[@]}" | sed 's/,$//' | awk '{print "["$0"]"}')
+      if ((${#FLS[@]})); then
+        files_json=$(printf '"%s",' "${FLS[@]}" | sed 's/,$//' | awk '{print "["$0"]"}')
+      fi
     fi
+
     MAN_PROJECTS+=("{\"name\":\"${proj}\",\"working_dir\":\"${wdir}\",\"files\":${files_json}}")
   done
 
-  {
-    echo "{"
-    echo "  \"created_at\": \"${STAMP}\","
-    echo "  \"bundle_id\": \"${RID}\","
-    echo "  \"images\": [$(printf "\"%s\"," "${IMAGES[@]}" | sed 's/,$//')],"
-    echo "  \"networks\": [$(printf "\"%s\"," "${NETLIST[@]}" | sed 's/,$//')],"
-    echo "  \"projects\": [$(printf "%s," "${MAN_PROJECTS[@]}" | sed 's/,$//')],"
-    echo "  \"volumes\": [$(printf "%s," "${MAN_VOL[@]}" | sed 's/,$//')],"
-    echo "  \"binds\": [$(printf "%s," "${MAN_BIND[@]}" | sed 's/,$//')],"
-    echo "  \"runs\": [$(printf "\"%s\"," "${RUNS[@]}" | sed 's/,$//')]"
-    echo "}"
-  } > "${BUNDLE}/manifest.json"
+  local images_json nets_json projects_json vols_json binds_json runs_json
+
+  if ((${#IMAGES[@]})); then
+    images_json=$(printf '"%s",' "${IMAGES[@]}" | sed 's/,$//')
+    images_json="[${images_json}]"
+  else
+    images_json="[]"
+  fi
+
+  if ((${#NETLIST2[@]})); then
+    nets_json=$(printf '"%s",' "${NETLIST2[@]}" | sed 's/,$//')
+    nets_json="[${nets_json}]"
+  else
+    nets_json="[]"
+  fi
+
+  if ((${#MAN_PROJECTS[@]})); then
+    projects_json=$(printf '%s,' "${MAN_PROJECTS[@]}" | sed 's/,$//')
+    projects_json="[${projects_json}]"
+  else
+    projects_json="[]"
+  fi
+
+  if ((${#MAN_VOL[@]})); then
+    vols_json=$(printf '%s,' "${MAN_VOL[@]}" | sed 's/,$//')
+    vols_json="[${vols_json}]"
+  else
+    vols_json="[]"
+  fi
+
+  if ((${#MAN_BIND[@]})); then
+    binds_json=$(printf '%s,' "${MAN_BIND[@]}" | sed 's/,$//')
+    binds_json="[${binds_json}]"
+  else
+    binds_json="[]"
+  fi
+
+  if ((${#RUNS[@]})); then
+    runs_json=$(printf '"%s",' "${RUNS[@]}" | sed 's/,$//')
+    runs_json="[${runs_json}]"
+  else
+    runs_json="[]"
+  fi
+
+  cat > "${BUNDLE}/manifest.json" <<EOF
+{
+  "created_at": "${STAMP}",
+  "bundle_id": "${RID}",
+  "images": ${images_json},
+  "networks": ${nets_json},
+  "projects": ${projects_json},
+  "volumes": ${vols_json},
+  "binds": ${binds_json},
+  "runs": ${runs_json}
+}
+EOF
 
   cat > "${BUNDLE}/restore.sh" <<'REST_SH'
 #!/usr/bin/env bash
 set -euo pipefail
-BUNDLE_DIR="$(cd "$(dirname "$0")" && pwd)"; cd "$BUNDLE_DIR"
-say(){ echo -e "\033[1;34m$*\033[0m"; }; warn(){ echo -e "\033[1;33m$*\033[0m"; }
+
+BUNDLE_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$BUNDLE_DIR"
+
+say(){  echo -e "\033[1;34m$*\033[0m"; }
+warn(){ echo -e "\033[1;33m$*\033[0m"; }
 
 say "[A] 加载镜像（如 images.tar 存在）"
-[[ -f images.tar ]] && docker load -i images.tar || warn "images.tar 不存在，将按需在线拉取镜像"
+if [[ -f images.tar ]]; then
+  docker load -i images.tar
+else
+  warn "images.tar 不存在，将按需在线拉取镜像。"
+fi
 
 say "[B] 创建自定义网络（如有）"
-if jq -e ".networks|length>0" manifest.json >/dev/null; then
-  for n in $(jq -r ".networks[]" manifest.json); do case "$n" in bridge|host|none) :;; *) docker network create "$n" >/dev/null 2>&1 || true;; esac; done
+if jq -e ".networks|length>0" manifest.json >/dev/null 2>&1; then
+  for n in $(jq -r ".networks[]" manifest.json); do
+    case "$n" in
+      bridge|host|none) : ;;
+      *) docker network create "$n" >/dev/null 2>&1 || true ;;
+    esac
+  done
 fi
 
 say "[C] 回灌命名卷"
-if jq -e ".volumes|length>0" manifest.json >/dev/null; then
+if jq -e ".volumes|length>0" manifest.json >/dev/null 2>&1; then
   mkdir -p volumes
   while IFS= read -r row; do
-    vname=$(jq -r ".name" <<<"$row"); file="vol_${vname}.tgz"
-    [[ -f "volumes/$file" ]] || { warn "  跳过 $vname（缺少 volumes/$file）"; continue; }
+    vname=$(jq -r ".name" <<<"$row")
+    file="vol_${vname}.tgz"
+    if [[ ! -f "volumes/$file" ]]; then
+      warn "  跳过 $vname（缺少 volumes/$file）"
+      continue
+    fi
     echo "  - ${vname}"
     docker volume create "$vname" >/dev/null 2>&1 || true
-    docker run --rm -v "${vname}:/to" -v "$PWD/volumes:/from" alpine:3.20 sh -c "cd /to && tar -xzf /from/${file}"
+    docker run --rm \
+      -v "${vname}:/to" \
+      -v "$PWD/volumes:/from" \
+      alpine:3.20 sh -c "cd /to && tar -xzf /from/${file}"
   done < <(jq -c ".volumes[]" manifest.json)
 fi
 
 say "[D] 回灌绑定目录"
-if jq -e ".binds|length>0" manifest.json >/dev/null; then
+if jq -e ".binds|length>0" manifest.json >/dev/null 2>&1; then
   mkdir -p binds
   while IFS= read -r row; do
     host=$(jq -r ".host" <<<"$row")
     file=$(jq -r ".file" <<<"$row")
     echo "  - ${host}"
-
-    # 只创建父目录，兼容文件型绑定（例如 /etc/localtime）
     parent="$(dirname "$host")"
     mkdir -p "$parent" || true
-
-    # 归档按绝对路径制作，直接从根解包覆盖/写入
     tar -C / -xzf "binds/${file}"
   done < <(jq -c ".binds[]" manifest.json)
 fi
 
 say "[E] 恢复 Compose 项目"
-if jq -e ".projects|length>0" manifest.json >/dev/null; then
+if jq -e ".projects|length>0" manifest.json >/dev/null 2>&1; then
   mkdir -p compose_restore
   while IFS= read -r row; do
-    name=$(jq -r ".name" <<<"$row"); echo "  - project: $name"; mkdir -p "compose_restore/${name}"
-    if compgen -G "compose/${name}/*.tgz" >/dev/null; then
-      for t in compose/${name}/*.tgz; do tar -xzf "$t" -C "compose_restore/${name}" 2>/dev/null || true; done
+    name=$(jq -r ".name" <<<"$row")
+    wdir=$(jq -r ".working_dir // \"\"" <<<"$row")
+
+    echo "  - project: $name"
+    mkdir -p "compose_restore/${name}"
+
+    # 1) 把 compose 文件放到 compose_restore/<name> 下，供当前恢复使用
+    if compgen -G "compose/${name}/*" >/dev/null 2>&1; then
+      for f in compose/${name}/*; do
+        [ -f "$f" ] || continue
+        base="$(basename "$f")"
+        cp -a "$f" "compose_restore/${name}/${base}" 2>/dev/null || true
+      done
     fi
-    for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml .env docker-compose.override.yml compose.override.yaml; do
-      [[ -f "compose/${name}/${f}" ]] && cp -a "compose/${name}/${f}" "compose_restore/${name}/${f}" || true
-    done
+
+    # 2) 尝试把配置文件恢复到原 working_dir
+    if [[ -n "$wdir" ]]; then
+      echo "    · 还原 compose 配置到原路径：$wdir"
+      mkdir -p "$wdir" || true
+      if compgen -G "compose/${name}/*" >/dev/null 2>&1; then
+        for f in compose/${name}/*; do
+          [ -f "$f" ] || continue
+          base="$(basename "$f")"
+          if cp -n "$f" "$wdir/$base" 2>/dev/null; then
+            :
+          else
+            cp "$f" "$wdir/$base" 2>/dev/null || true
+          fi
+        done
+      fi
+    fi
+
     NET="${name}_default"
     if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-      (cd "compose_restore/${name}" && docker compose down || true; docker network rm "$NET" >/dev/null 2>&1 || true; docker compose up -d)
+      (
+        cd "compose_restore/${name}"
+        docker compose down || true
+        docker network rm "$NET" >/dev/null 2>&1 || true
+        docker compose up -d
+      )
     elif command -v docker-compose >/dev/null 2>&1; then
-      (cd "compose_restore/${name}" && docker-compose down || true; docker network rm "$NET" >/dev/null 2>&1 || true; docker-compose up -d)
+      (
+        cd "compose_restore/${name}"
+        docker-compose down || true
+        docker network rm "$NET" >/dev/null 2>&1 || true
+        docker-compose up -d
+      )
     else
-      warn "  新机未安装 docker compose/docker-compose，跳过该项目"
+      warn "  新机未安装 docker compose/docker-compose，跳过该项目。"
     fi
   done < <(jq -c ".projects[]" manifest.json)
 fi
 
 say "[F] 恢复单容器（非 Compose）"
-if jq -e ".runs|length>0" manifest.json >/dev/null; then
-  for r in $(jq -r ".runs[]" manifest.json); do echo "  - $r"; bash "$r" || true; done
+if jq -e ".runs|length>0" manifest.json >/dev/null 2>&1; then
+  for r in $(jq -r ".runs[]" manifest.json); do
+    echo "  - $r"
+    bash "$r" || true
+  done
 fi
 
 say "[G] 完成，当前容器："
 docker ps --format "  {{.Names}}\t{{.Status}}\t{{.Ports}}"
 echo "提示：若端口被占用，请编辑 compose 或 runs 脚本后再次执行。"
 REST_SH
+
   chmod +x "${BUNDLE}/restore.sh"
 }
+
 spinner_run "[INFO] 生成 manifest.json 与 restore.sh ..." generate_manifest_and_restore
 
-# ---------- README ----------
+#####################################
+#  README & 打包为单文件
+#####################################
+
 cat > "${BUNDLE}/README.txt" <<EOF
-新服务器操作：
-- 推荐：使用 auto_restore.sh 输入“一键包下载”链接（.tar.gz），自动下载解压并执行 restore.sh
-- 手动：下载整个目录后，bash restore.sh
+Docker 一键迁移包
+
+bundle_id: ${RID}
+created_at: ${STAMP}
+
+使用方法：
+  在新服务器上执行：
+
+    bash <(curl -fsSL https://raw.githubusercontent.com/lx969788249/docker_migrate/master/auto_restore.sh)
+
+  然后粘贴本机输出的下载链接（以 .tar.gz 结尾）即可。
 EOF
 
-# ---------- single-file bundle (RID.tar.gz) ----------
 BUNDLE_BASENAME="$(basename "${BUNDLE}")"
-spinner_run "[INFO] 生成单文件包 ${BUNDLE_BASENAME}.tar.gz ..." bash -c "(cd \"$(dirname "${BUNDLE}")\" && tar -czf \"${BUNDLE_BASENAME}.tar.gz\" \"${BUNDLE_BASENAME}\")"
-SINGLE_TAR_PATH="$(dirname "${BUNDLE}")/${BUNDLE_BASENAME}.tar.gz"
+spinner_run "[INFO] 生成单文件包 ${BUNDLE_BASENAME}.tar.gz ..." \
+  tar -C "${BUNDLE_ROOT}" -czf "${BUNDLE_ROOT}/${BUNDLE_BASENAME}.tar.gz" "${BUNDLE_BASENAME}"
 
-# ---------- HTTP serve + post-restart + hard clean ----------
-OK  "[OK] 生成完成：${BUNDLE}"
+SINGLE_TAR_PATH="${BUNDLE_ROOT}/${BUNDLE_BASENAME}.tar.gz"
+
+#####################################
+#  HTTP 服务 + 用户自选端口 + 安全路径 + 清理
+#####################################
+
+OK "[OK] 打包完成：${BUNDLE}"
 ( cd "${BUNDLE}" && ls -lah )
 
-PORT="${PORT:-8080}"; PORT="$(pick_free_port "$PORT")"
-URL="$(pick_advertise_url "$PORT" "$RID")"
+# 询问端口（可覆盖默认）
+if [[ -t 0 ]]; then
+  read -rp "请输入用于传输的 HTTP 端口 [回车=默认 ${PORT}]：" IN_PORT || IN_PORT=""
+  if [[ -n "${IN_PORT:-}" ]]; then
+    if [[ "$IN_PORT" =~ ^[0-9]+$ ]] && (( IN_PORT >= 1 && IN_PORT <= 65535 )); then
+      NEW_PORT="$(pick_free_port "$IN_PORT")"
+      if [[ "$NEW_PORT" != "$IN_PORT" ]]; then
+        YEL "[WARN] 端口 ${IN_PORT} 已占用，改用临近可用端口：${NEW_PORT}"
+      fi
+      PORT="$NEW_PORT"
+    else
+      YEL "[WARN] 输入端口无效，继续使用默认端口：${PORT}"
+    fi
+  fi
+fi
 
-BLUE "[INFO] 启动 HTTP 服务（python3 -m http.server ${PORT}）"
+SECRET_TOKEN="$(head -c 12 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16)"
+
+BASE_URL="$(pick_advertise_url "$PORT" "$RID")"
+FINAL_URL="${BASE_URL}/${SECRET_TOKEN}/${BUNDLE_BASENAME}.tar.gz"
+
+BLUE "[INFO] 启动 HTTP 服务（端口 ${PORT}，仅允许路径 /${SECRET_TOKEN}/${BUNDLE_BASENAME}.tar.gz）"
+
 SHPID=""
-cleanup_http(){ [[ -n "${SHPID:-}" ]] && kill "${SHPID}" 2>/dev/null || true; }
 
-# 无条件删除：关 HTTP → 重启容器 → 删除 bundle/<RID>/ 与 <RID>.tar.gz
-hard_clean(){
-  rm -rf "${BUNDLE}" 2>/dev/null || true
-  rm -f  "$(dirname "${BUNDLE}")/$(basename "${BUNDLE}").tar.gz" 2>/dev/null || true
-  OK "[OK] 已清理：工作目录与单文件包"
+cleanup_http() {
+  if [[ -n "${SHPID:-}" ]]; then
+    kill "${SHPID}" 2>/dev/null || true
+  fi
 }
 
-# 退出时序：关HTTP → 重启容器（逐个）→ 无条件清理
-graceful_exit(){
+hard_clean() {
+  rm -rf "${BUNDLE}" 2>/dev/null || true
+  rm -f "${SINGLE_TAR_PATH}" 2>/dev/null || true
+  OK "[OK] 已清理 bundle 目录及单文件包"
+}
+
+graceful_exit() {
   echo
   YEL "[INFO] 即将退出，先关闭 HTTP 服务 ..."
   cleanup_http
@@ -408,6 +1006,7 @@ graceful_exit(){
   if ((${#STOPPED_ON_BACKUP[@]})); then
     BLUE "[INFO] 重启本次停机的容器（共 ${#STOPPED_ON_BACKUP[@]} 个） ..."
     local ok=0 fail=0
+    local n
     for n in "${STOPPED_ON_BACKUP[@]}"; do
       printf "  - starting: %s ... " "$n"
       if docker start "$n" >/dev/null 2>&1; then
@@ -418,25 +1017,71 @@ graceful_exit(){
     done
     OK "[OK] 重启完成：成功 ${ok} / 失败 ${fail}"
   else
-    YEL "[INFO] 本次未停任何容器，无需重启"
+    YEL "[INFO] 本次未停任何容器，无需重启。"
   fi
 
   YEL "[INFO] 清理打包产物 ..."
   hard_clean
   exit 0
 }
+
 trap graceful_exit INT TERM
 
-( cd "$(dirname "${BUNDLE}")" && python3 -m http.server "${PORT}" >/dev/null 2>&1 & )
-SHPID=$!; sleep 1
+# 启动自定义 Python HTTP 服务：仅允许访问 /<SECRET_TOKEN>/<BUNDLE_BASENAME>.tar.gz
+cd "${BUNDLE_ROOT}" || exit 1
+python3 - "$PORT" "$SECRET_TOKEN" "$BUNDLE_BASENAME" >/dev/null 2>&1 <<'PY' &
+import http.server
+import socketserver
+import sys
+import os
 
-# 只输出一个下载链接（公网优先，探测不到则回退内网/127.0.0.1）
-OK  "[OK] 下载链接： ${URL}"
-YEL "[WARN] HTTP 未鉴权，仅限可信网络使用。完成后关闭此窗口。"
+port = int(sys.argv[1])
+secret = sys.argv[2]
+bundle_basename = sys.argv[3]
+fname = bundle_basename + ".tar.gz"
+allowed_path = "/" + secret + "/" + fname
+root = os.getcwd()
 
-# 交互等待；回车 -> 关 HTTP → 重启 → 无条件清理
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        path = self.path.split("?", 1)[0].split("#", 1)[0]
+        if path != allowed_path:
+            self.send_response(404)
+            self.end_headers()
+            return
+        fpath = os.path.join(root, fname)
+        try:
+            st = os.stat(fpath)
+        except FileNotFoundError:
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/gzip")
+        self.send_header("Content-Length", str(st.st_size))
+        self.end_headers()
+        with open(fpath, "rb") as f:
+            while True:
+                chunk = f.read(64 * 1024)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+
+    def log_message(self, format, *args):
+        return
+
+with socketserver.TCPServer(("", port), Handler) as httpd:
+    httpd.serve_forever()
+PY
+SHPID=$!
+cd "$WORKDIR"
+sleep 1
+
+OK  "[OK] 一键迁移包下载链接：${FINAL_URL}"
+YEL "[WARN] HTTP 为明文传输，请仅在可信网络使用。"
+
 if [[ -t 0 ]]; then
-  read -rp $'\n按回车键停止 HTTP 并退出（将自动重启停机容器并清理产物）... '
+  read -rp $'\n按回车键停止 HTTP 并退出（将自动重启停机容器并清理产物）...' _
   graceful_exit
 else
   graceful_exit
