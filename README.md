@@ -46,10 +46,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lx969788249/docker_migrate/m
 
 ## **⭐️ 支持一下**
 
-## 如果这个项目对你有帮助，欢迎点个 Star！[https://github.com/lx969788249/docker\_migrate](https://github.com/lx969788249/docker_migrate)
+## 如果这个项目对你有帮助，欢迎点个 Star
 
 也欢迎提交 Issue 或 PR，一起优化功能。
 
-## **🧑‍💻 作者**
-
-## MIT License © lx969788249
