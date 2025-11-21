@@ -869,12 +869,19 @@ if jq -e ".projects|length>0" manifest.json >/dev/null 2>&1; then
     mkdir -p "compose_restore/${name}"
 
     # 1) 把 compose 文件放到 compose_restore/<name> 下，供当前恢复使用
+    mkdir -p "compose_restore/${name}"
+
+    # 1) 把 compose 文件放到 compose_restore/<name> 下，供当前恢复使用
     if compgen -G "compose/${name}/*" >/dev/null 2>&1; then
       for f in compose/${name}/*; do
         [ -f "$f" ] || continue
         base="$(basename "$f")"
         cp -a "$f" "compose_restore/${name}/${base}" 2>/dev/null || true
       done
+    fi
+    # * 不会匹配 .env，这里单独把 .env 带上（如果有）
+    if [[ -f "compose/${name}/.env" ]]; then
+      cp -a "compose/${name}/.env" "compose_restore/${name}/.env" 2>/dev/null || true
     fi
 
     # 2) 尝试把配置文件恢复到原 working_dir
@@ -891,6 +898,14 @@ if jq -e ".projects|length>0" manifest.json >/dev/null 2>&1; then
             cp "$f" "$wdir/$base" 2>/dev/null || true
           fi
         done
+      fi
+      # 同样把 .env 还原回原目录（如果有）
+      if [[ -f "compose/${name}/.env" ]]; then
+        if cp -n "compose/${name}/.env" "$wdir/.env" 2>/dev/null; then
+          :
+        else
+          cp "compose/${name}/.env" "$wdir/.env" 2>/dev/null || true
+        fi
       fi
     fi
 
