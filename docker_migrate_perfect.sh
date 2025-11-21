@@ -17,7 +17,10 @@
 #   --include=name1,...  # 按容器名称精确匹配，只迁移指定容器（不使用分组菜单）
 
 set -euo pipefail
-
+declare -a IDS=()
+declare -a STANDALONE_IDS=()
+declare -a STANDALONE_NAMES=()
+declare -a GROUP_KEYS=()
 #####################################
 #  基础函数 & 依赖管理
 #####################################
