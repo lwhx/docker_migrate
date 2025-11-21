@@ -869,9 +869,6 @@ if jq -e ".projects|length>0" manifest.json >/dev/null 2>&1; then
     mkdir -p "compose_restore/${name}"
 
     # 1) 把 compose 文件放到 compose_restore/<name> 下，供当前恢复使用
-    mkdir -p "compose_restore/${name}"
-
-    # 1) 把 compose 文件放到 compose_restore/<name> 下，供当前恢复使用
     if compgen -G "compose/${name}/*" >/dev/null 2>&1; then
       for f in compose/${name}/*; do
         [ -f "$f" ] || continue
@@ -908,11 +905,22 @@ if jq -e ".projects|length>0" manifest.json >/dev/null 2>&1; then
         fi
       fi
     fi
-
     NET="${name}_default"
     if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
       (
         cd "compose_restore/${name}"
+
+        # 优先加载 compose_restore/<name> 里的 .env，其次尝试原 working_dir 的 .env
+        if [[ -f .env ]]; then
+          set -a
+          . ./.env
+          set +a
+        elif [[ -n "$wdir" && -f "$wdir/.env" ]]; then
+          set -a
+          . "$wdir/.env"
+          set +a
+        fi
+
         docker compose down || true
         docker network rm "$NET" >/dev/null 2>&1 || true
         docker compose up -d
@@ -920,6 +928,17 @@ if jq -e ".projects|length>0" manifest.json >/dev/null 2>&1; then
     elif command -v docker-compose >/dev/null 2>&1; then
       (
         cd "compose_restore/${name}"
+
+        if [[ -f .env ]]; then
+          set -a
+          . ./.env
+          set +a
+        elif [[ -n "$wdir" && -f "$wdir/.env" ]]; then
+          set -a
+          . "$wdir/.env"
+          set +a
+        fi
+
         docker-compose down || true
         docker network rm "$NET" >/dev/null 2>&1 || true
         docker-compose up -d
