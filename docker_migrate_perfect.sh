@@ -21,6 +21,7 @@ declare -a IDS=()
 declare -a STANDALONE_IDS=()
 declare -a STANDALONE_NAMES=()
 declare -a GROUP_KEYS=()
+declare -a RUNS=()
 #####################################
 #  基础函数 & 依赖管理
 #####################################
@@ -245,6 +246,276 @@ pick_free_port() {
     p=$((p+1))
   done
   echo "${1:-8080}"
+}
+
+write_run_script() {
+  local name="$1"
+  local out="$2"
+
+  cat > "$out" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+BUNDLE_DIR="\$(cd "\$(dirname "\$0")/.." && pwd)"
+META="\${BUNDLE_DIR}/meta/${name}.inspect.json"
+
+if [[ ! -f "\$META" ]]; then
+  echo "[WARN] meta file missing: \$META" >&2
+  exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "[WARN] jq is required to restore container: ${name}" >&2
+  exit 1
+fi
+
+name="\$(jq -r '.[0].Name | ltrimstr("/")' "\$META")"
+image="\$(jq -r '.[0].Config.Image' "\$META")"
+
+if [[ -z "\$name" || -z "\$image" || "\$image" == "null" ]]; then
+  echo "[WARN] invalid container metadata for ${name}" >&2
+  exit 1
+fi
+
+if docker ps -a --format '{{.Names}}' | grep -Fxq "\$name"; then
+  echo "[INFO] container exists: \$name; start if stopped"
+  docker start "\$name" >/dev/null 2>&1 || true
+  exit 0
+fi
+
+args=(docker run -d --name "\$name")
+
+mapfile -t entrypoint < <(jq -r '.[0].Config.Entrypoint[]?' "\$META")
+mapfile -t cmd < <(jq -r '.[0].Config.Cmd[]?' "\$META")
+cmd_args=()
+if ((\${#entrypoint[@]})); then
+  args+=( --entrypoint "\${entrypoint[0]}" )
+  if ((\${#entrypoint[@]} > 1)); then
+    cmd_args+=( "\${entrypoint[@]:1}" )
+  fi
+fi
+if ((\${#cmd[@]})); then
+  cmd_args+=( "\${cmd[@]}" )
+fi
+
+user="\$(jq -r '.[0].Config.User // empty' "\$META")"
+[[ -n "\$user" ]] && args+=( -u "\$user" )
+workdir="\$(jq -r '.[0].Config.WorkingDir // empty' "\$META")"
+[[ -n "\$workdir" ]] && args+=( -w "\$workdir" )
+
+cid="\$(jq -r '.[0].Id' "\$META")"
+default_host="\${cid:0:12}"
+hostname="\$(jq -r '.[0].Config.Hostname // empty' "\$META")"
+if [[ -n "\$hostname" && "\$hostname" != "\$default_host" ]]; then
+  args+=( --hostname "\$hostname" )
+fi
+domainname="\$(jq -r '.[0].Config.Domainname // empty' "\$META")"
+[[ -n "\$domainname" ]] && args+=( --domainname "\$domainname" )
+
+mapfile -t envs < <(jq -r '.[0].Config.Env[]?' "\$META")
+for e in "\${envs[@]}"; do
+  args+=( -e "\$e" )
+done
+
+mapfile -t labels < <(jq -r '.[0].Config.Labels // {} | to_entries[]? | "\(.key)=\(.value)"' "\$META")
+for l in "\${labels[@]}"; do
+  args+=( --label "\$l" )
+done
+
+restart_name="\$(jq -r '.[0].HostConfig.RestartPolicy.Name // empty' "\$META")"
+restart_max="\$(jq -r '.[0].HostConfig.RestartPolicy.MaximumRetryCount // 0' "\$META")"
+if [[ -n "\$restart_name" && "\$restart_name" != "no" ]]; then
+  if [[ "\$restart_name" == "on-failure" && "\$restart_max" -gt 0 ]]; then
+    args+=( --restart "\${restart_name}:\${restart_max}" )
+  else
+    args+=( --restart "\$restart_name" )
+  fi
+fi
+
+if jq -e '.[0].HostConfig.Privileged == true' "\$META" >/dev/null 2>&1; then
+  args+=( --privileged )
+fi
+if jq -e '.[0].HostConfig.ReadonlyRootfs == true' "\$META" >/dev/null 2>&1; then
+  args+=( --read-only )
+fi
+if jq -e '.[0].HostConfig.Init == true' "\$META" >/dev/null 2>&1; then
+  args+=( --init )
+fi
+if jq -e '.[0].HostConfig.AutoRemove == true' "\$META" >/dev/null 2>&1; then
+  args+=( --rm )
+fi
+
+mapfile -t extra_hosts < <(jq -r '.[0].HostConfig.ExtraHosts[]?' "\$META")
+for h in "\${extra_hosts[@]}"; do
+  args+=( --add-host "\$h" )
+done
+
+mapfile -t dns_list < <(jq -r '.[0].HostConfig.Dns[]?' "\$META")
+for d in "\${dns_list[@]}"; do
+  args+=( --dns "\$d" )
+done
+mapfile -t dns_search < <(jq -r '.[0].HostConfig.DnsSearch[]?' "\$META")
+for d in "\${dns_search[@]}"; do
+  args+=( --dns-search "\$d" )
+done
+mapfile -t dns_opts < <(jq -r '.[0].HostConfig.DnsOptions[]?' "\$META")
+for d in "\${dns_opts[@]}"; do
+  args+=( --dns-option "\$d" )
+done
+
+mapfile -t cap_add < <(jq -r '.[0].HostConfig.CapAdd[]?' "\$META")
+for c in "\${cap_add[@]}"; do
+  args+=( --cap-add "\$c" )
+done
+mapfile -t cap_drop < <(jq -r '.[0].HostConfig.CapDrop[]?' "\$META")
+for c in "\${cap_drop[@]}"; do
+  args+=( --cap-drop "\$c" )
+done
+mapfile -t sec_opts < <(jq -r '.[0].HostConfig.SecurityOpt[]?' "\$META")
+for s in "\${sec_opts[@]}"; do
+  args+=( --security-opt "\$s" )
+done
+
+mapfile -t sysctls < <(jq -r '.[0].HostConfig.Sysctls // {} | to_entries[]? | "\(.key)=\(.value)"' "\$META")
+for s in "\${sysctls[@]}"; do
+  args+=( --sysctl "\$s" )
+done
+
+mapfile -t ulimits < <(jq -r '.[0].HostConfig.Ulimits[]? | "\(.Name)=\(.Soft):\(.Hard)"' "\$META")
+for u in "\${ulimits[@]}"; do
+  args+=( --ulimit "\$u" )
+done
+
+mapfile -t tmpfs < <(jq -r '.[0].HostConfig.Tmpfs // {} | to_entries[]? | "\(.key):\(.value)"' "\$META")
+for t in "\${tmpfs[@]}"; do
+  args+=( --tmpfs "\$t" )
+done
+
+log_driver="\$(jq -r '.[0].HostConfig.LogConfig.Type // empty' "\$META")"
+if [[ -n "\$log_driver" && "\$log_driver" != "json-file" ]]; then
+  args+=( --log-driver "\$log_driver" )
+fi
+mapfile -t log_opts < <(jq -r '.[0].HostConfig.LogConfig.Config // {} | to_entries[]? | "\(.key)=\(.value)"' "\$META")
+for o in "\${log_opts[@]}"; do
+  args+=( --log-opt "\$o" )
+done
+
+publish_all="\$(jq -r '.[0].HostConfig.PublishAllPorts // false' "\$META")"
+if [[ "\$publish_all" == "true" ]]; then
+  args+=( -P )
+fi
+mapfile -t port_bindings < <(jq -r '.[0].HostConfig.PortBindings // {} | to_entries[]? | .key as \$c | .value[]? | "\(.HostIp)|\(.HostPort)|\(\$c)"' "\$META")
+for p in "\${port_bindings[@]}"; do
+  host_ip="\${p%%|*}"
+  rest="\${p#*|}"
+  host_port="\${rest%%|*}"
+  cont_port="\${rest#*|}"
+  if [[ -n "\$host_ip" && "\$host_ip" != "0.0.0.0" && "\$host_ip" != "::" ]]; then
+    args+=( -p "\${host_ip}:\${host_port}:\${cont_port}" )
+  else
+    args+=( -p "\${host_port}:\${cont_port}" )
+  fi
+done
+
+mapfile -t mounts < <(jq -r '.[0].Mounts[]? | @base64' "\$META")
+for m in "\${mounts[@]}"; do
+  _jq(){ echo "\$m" | base64 -d | jq -r "\$1"; }
+  m_type="\$(_jq '.Type')"
+  dest="\$(_jq '.Destination')"
+  rw="\$(_jq '.RW')"
+  mode="\$(_jq '.Mode // empty')"
+
+  src=""
+  case "\$m_type" in
+    volume)
+      src="\$(_jq '.Name')"
+      ;;
+    bind)
+      src="\$(_jq '.Source')"
+      ;;
+    tmpfs)
+      ;;
+  esac
+
+  if [[ -z "\$src" || -z "\$dest" ]]; then
+    continue
+  fi
+
+  opts=()
+  if [[ -n "\$mode" && "\$mode" != "null" ]]; then
+    IFS=',' read -r -a mode_parts <<<"\$mode"
+    for part in "\${mode_parts[@]}"; do
+      [[ -n "\$part" ]] && opts+=( "\$part" )
+    done
+  fi
+  if [[ "\$rw" != "true" ]]; then
+    opts+=( "ro" )
+  fi
+
+  if ((\${#opts[@]})); then
+    optstr="\$(IFS=,; echo "\${opts[*]}")"
+    args+=( -v "\${src}:\${dest}:\${optstr}" )
+  else
+    args+=( -v "\${src}:\${dest}" )
+  fi
+done
+
+network_mode="\$(jq -r '.[0].HostConfig.NetworkMode // empty' "\$META")"
+if [[ "\$network_mode" == container:* ]]; then
+  ref="\${network_mode#container:}"
+  if [[ "\$ref" =~ ^[0-9a-f]{12,}$ ]]; then
+    for f in "\${BUNDLE_DIR}"/meta/*.inspect.json; do
+      cid="\$(jq -r '.[0].Id' "\$f")"
+      if [[ "\$cid" == "\$ref" || "\${cid:0:12}" == "\$ref" ]]; then
+        cname="\$(jq -r '.[0].Name | ltrimstr("/")' "\$f")"
+        network_mode="container:\$cname"
+        break
+      fi
+    done
+  fi
+fi
+
+primary_net=""
+if [[ -n "\$network_mode" && "\$network_mode" != "default" && "\$network_mode" != "bridge" ]]; then
+  args+=( --network "\$network_mode" )
+  primary_net="\$network_mode"
+else
+  primary_net="bridge"
+fi
+
+args+=( "\$image" )
+if ((\${#cmd_args[@]})); then
+  args+=( "\${cmd_args[@]}" )
+fi
+
+"\${args[@]}"
+
+if [[ "\$network_mode" != "host" && "\$network_mode" != "none" && "\$network_mode" != container:* ]]; then
+  mapfile -t net_entries < <(jq -r '.[0].NetworkSettings.Networks | to_entries[]? | @base64' "\$META")
+  for entry in "\${net_entries[@]}"; do
+    _net(){ echo "\$entry" | base64 -d | jq -r "\$1"; }
+    net_name="\$(_net '.key')"
+    [[ -z "\$net_name" || "\$net_name" == "\$primary_net" || "\$net_name" == "bridge" ]] && continue
+
+    ip="\$(_net '.value.IPAddress')"
+    ip6="\$(_net '.value.IPv6Address')"
+    aliases_raw="\$(_net '.value.Aliases // empty | join(\" \")')"
+
+    conn_args=()
+    [[ -n "\$ip" ]] && conn_args+=( --ip "\$ip" )
+    [[ -n "\$ip6" ]] && conn_args+=( --ip6 "\$ip6" )
+    if [[ -n "\$aliases_raw" ]]; then
+      for a in \$aliases_raw; do
+        conn_args+=( --alias "\$a" )
+      done
+    fi
+
+    docker network connect "\${conn_args[@]}" "\$net_name" "\$name" >/dev/null 2>&1 || true
+  done
+fi
+EOF
+
+  chmod +x "$out"
 }
 
 #####################################
@@ -700,6 +971,23 @@ for id in "${IDS[@]}"; do
 done
 
 #####################################
+#  生成独立容器 run 脚本
+#####################################
+
+if ((${#IDS[@]})); then
+  BLUE "[INFO] 生成独立容器 run 脚本 ..."
+  for id in "${IDS[@]}"; do
+    if [[ "${CONTAINER_IS_COMPOSE[$id]}" == "1" ]]; then
+      continue
+    fi
+    n="${CONTAINER_NAME[$id]}"
+    run_file="${BUNDLE}/runs/${n}.sh"
+    write_run_script "$n" "$run_file"
+    RUNS+=("runs/$(basename "$run_file")")
+  done
+fi
+
+#####################################
 #  保存镜像 images.tar
 #####################################
 
@@ -720,7 +1008,6 @@ fi
 #  生成 manifest.json 与 restore.sh
 #####################################
 
-declare -a RUNS=()   # 预留：未来可以为非 compose 容器生成 run 脚本
 
 generate_manifest_and_restore() {
   mapfile -t NETLIST2 < <(printf "%s\n" "${!NETWORKS[@]}" | sort -u)
